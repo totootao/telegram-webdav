@@ -197,6 +197,179 @@ def _flac(head, _size):
     return total_samples / sample_rate
 
 
+# ---------------------------------------------------------------- MKV / WebM (EBML)
+# EBML 元素 ID（顶层/常用）
+_EBML_SEGMENT = 0x18538067
+_EBML_INFO = 0x1549A966
+_EBML_TIMESTAMPSCALE = 0x2AD7B1
+_EBML_DURATION = 0x4489
+_EBML_CLUSTER = 0x1F43B675
+_EBML_MAGIC = b"\x1a\x45\xdf\xa3"  # EBML header 固定以这 4 字节开头
+
+
+def _vint(b, pos, keep_marker):
+    """读 EBML 变长整数(VINT)，返回 (值, 占用字节数)；失败返回 (None, 0)。
+
+    VINT 规则：第一个字节的前导零个数 + 1 = 总长度；那个"1"是长度标记位。
+    读 ID 时保留标记位（ID 本身含它），读 Size 时要去掉。
+    """
+    if pos >= len(b):
+        return None, 0
+    b0 = b[pos]
+    if b0 == 0:
+        return None, 0
+    n = 0
+    while not (b0 & (0x80 >> n)):
+        n += 1
+        if n > 7:
+            return None, 0
+    length = n + 1
+    if pos + length > len(b):
+        return None, 0
+    if keep_marker:
+        return int.from_bytes(b[pos:pos + length], "big"), length
+    val = b0 & (0xFF >> (n + 1))
+    for i in range(1, length):
+        val = (val << 8) | b[pos + i]
+    return val, length
+
+
+def _ebml_iter(b, start, end):
+    """迭代 [start, end) 区间内的 EBML 元素，yield (id, payload_start, payload_end)。
+
+    Size 为"未知长度"（数据位全 1，直播流常见）时，把余下区间整体当作该元素负载——
+    这样 Segment 未知长度时仍能进去找 Info。
+    """
+    pos = start
+    while pos < end:
+        eid, ln = _vint(b, pos, True)
+        if eid is None:
+            return
+        pos += ln
+        size, sn = _vint(b, pos, False)
+        if size is None:
+            return
+        pos += sn
+        if size == (1 << (7 * sn)) - 1:  # 未知长度
+            yield eid, pos, end
+            return
+        if pos + size > end:
+            yield eid, pos, end
+            return
+        yield eid, pos, pos + size
+        pos += size
+
+
+def _mkv(head, tail):
+    """Matroska / WebM：取 Segment→Info 里的 TimestampScale 与 Duration。
+
+    Duration 的单位是 TimestampScale（不是秒），需换算：
+        秒 = Duration × TimestampScale / 1e9
+    """
+    data = None
+    for cand in (head, tail):
+        if len(cand) >= 4 and cand[:4] == _EBML_MAGIC:
+            data = cand
+            break
+    if data is None:
+        return None
+    seg = None
+    for eid, ps, pe in _ebml_iter(data, 0, len(data)):
+        if eid == _EBML_SEGMENT:
+            seg = (ps, pe)
+            break
+    if seg is None:
+        return None
+    scale = None
+    dur = None
+    for eid, ps, pe in _ebml_iter(data, seg[0], seg[1]):
+        if eid == _EBML_INFO:
+            for ieid, ips, ipe in _ebml_iter(data, ps, pe):
+                if ieid == _EBML_TIMESTAMPSCALE and scale is None:
+                    scale = int.from_bytes(data[ips:ipe], "big")
+                elif ieid == _EBML_DURATION and dur is None:
+                    n = ipe - ips
+                    if n == 4:
+                        dur = struct.unpack(">f", data[ips:ipe])[0]
+                    elif n == 8:
+                        dur = struct.unpack(">d", data[ips:ipe])[0]
+            break
+        if eid == _EBML_CLUSTER:  # 已进 Cluster，Info 不会在它后面
+            break
+    if not dur or dur <= 0:
+        return None
+    return dur * (scale or 1000000) / 1e9
+
+
+# ---------------------------------------------------------------- OGG
+_OGG_MAGIC = b"OggS"
+
+
+def _ogg_page(b, pos):
+    """解析 pos 处的 Ogg 页，返回 (granule, header_type, page_end) 或 None。"""
+    if pos + 27 > len(b) or b[pos:pos + 4] != _OGG_MAGIC or b[pos + 4] != 0:
+        return None
+    granule = int.from_bytes(b[pos + 6:pos + 14], "little", signed=True)
+    htype = b[pos + 5]
+    nseg = b[pos + 26]
+    if pos + 27 + nseg > len(b):
+        return None
+    # 页负载总长 = segment_table 各项之和
+    page_end = pos + 27 + nseg + sum(b[pos + 27:pos + 27 + nseg])
+    return granule, htype, page_end
+
+
+def _ogg_codec(head):
+    """从首页的 ID header 认 codec，返回 (granule_rate, pre_skip)；不认识返回 None。"""
+    p = _ogg_page(head, 0)
+    if p is None:
+        return None
+    _granule, _htype, _pe = p
+    dstart = 27 + head[26]
+    d = head[dstart:dstart + 64]
+    # Opus：granule 恒定以 48kHz 计，且要减掉 pre_skip
+    if d.startswith(b"OpusHead") and len(d) >= 16:
+        return 48000.0, int.from_bytes(d[10:12], "little")
+    # Vorbis：granule 是 PCM 采样数，采样率在 ID header 的 12:16
+    if len(d) >= 16 and d[0] == 0x01 and d[1:7] == b"vorbis":
+        sr = int.from_bytes(d[12:16], "little")
+        if sr > 0:
+            return float(sr), 0
+    # Theora(视频) 的 granule 编码了帧号与关键帧偏移，暂不支持
+    return None
+
+
+def _ogg(head, tail):
+    """OGG：首页认 codec 取 granule 速率，尾页取 granule_position 换算时长。"""
+    info = _ogg_codec(head)
+    if info is None:
+        return None
+    rate, pre_skip = info
+    best_eos = best_max = None
+    n = len(tail)
+    pos = 0
+    while True:
+        i = tail.find(_OGG_MAGIC, pos)
+        if i < 0:
+            break
+        p = _ogg_page(tail, i)
+        if p is not None:
+            granule, htype, pe = p
+            # 页必须完整落在采样内，且 granule 有效，才算可信候选
+            if pe <= n and granule > 0:
+                if best_max is None or granule > best_max:
+                    best_max = granule
+                if htype & 0x04:  # EOS：真正的最后一页，最可信
+                    if best_eos is None or granule > best_eos:
+                        best_eos = granule
+        pos = i + 1
+    granule = best_eos if best_eos is not None else best_max
+    if not granule:
+        return None
+    dur = (granule - pre_skip) / rate
+    return dur if dur > 0 else None
+
+
 # ---------------------------------------------------------------- 入口
 def probe_duration(head, tail, size, name=""):
     """从采样字节里判断媒体时长，返回秒（float）；无法判断返回 None。
@@ -225,6 +398,14 @@ def probe_duration(head, tail, size, name=""):
         d = _mp4(head, tail)
         if d:
             return d
+    elif ext in ("mkv", "webm"):
+        d = _mkv(head, tail)
+        if d:
+            return d
+    elif ext in ("ogg", "oga", "opus", "ogv", "ogx", "spx"):
+        d = _ogg(head, tail)
+        if d:
+            return d
 
     # 2) 魔数嗅探（扩展名缺失或不靠谱时兜底）
     if head[:4] == b"fLaC":
@@ -237,6 +418,14 @@ def probe_duration(head, tail, size, name=""):
             return d
     if len(head) >= 8 and head[4:8] in _FTYP_LIKE:
         d = _mp4(head, tail)
+        if d:
+            return d
+    if head[:4] == _EBML_MAGIC:
+        d = _mkv(head, tail)
+        if d:
+            return d
+    if head[:4] == _OGG_MAGIC:
+        d = _ogg(head, tail)
         if d:
             return d
     if head[:3] == b"ID3" or (

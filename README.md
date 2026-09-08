@@ -92,9 +92,19 @@ WebDAV 客户端 ──PROPFIND/GET/PUT──▶ TelegramWebDAV (本服务)
 | 格式 | 取时长的依据 | 精度 |
 |---|---|---|
 | MP4 / M4A / M4B / M4V / MOV / 3GP | `moov` → `mvhd` 的 timescale / duration | 精确 |
+| MKV / WebM | EBML：`Segment` → `Info` 的 `TimestampScale` × `Duration` | 精确 |
+| OGG（Opus） | 末页 granule（恒按 48kHz 计）减 `pre_skip` | 精确 |
+| OGG（Vorbis） | 末页 granule（PCM 采样数）÷ ID header 的采样率 | 精确 |
 | MP3 | Xing / Info 头的总帧数；无 Xing 时按 CBR 比特率估算 | 精确 / 估算 |
 | WAV | `fmt ` 的字节率 + `data` 块大小 | 精确 |
 | FLAC | STREAMINFO 的 sample rate 与 total samples | 精确 |
+
+两个容易踩的坑（已在代码里处理）：
+
+- **MKV 的 `Duration` 不是秒**，而是以 `TimestampScale` 为单位的计数值，必须换算
+  `秒 = Duration × TimestampScale / 1e9`。
+- **OGG 的 granule 单位是 codec 相关的**：Opus 恒定按 48kHz 计（与输入采样率无关）
+  且要减掉 `pre_skip`，Vorbis 则是 PCM 采样数 ÷ 采样率。认错 codec 会差出数量级。
 
 **开销**：只在 PUT 时取**首片头部 512KB + 末片尾部 4MB** 做采样，O(采样) 解析，
 不全文扫描；解析失败一律返回 `None`，绝不影响上传结果。相比分片上传的网络 I/O 可忽略。
@@ -109,10 +119,12 @@ WebDAV 客户端 ──PROPFIND/GET/PUT──▶ TelegramWebDAV (本服务)
 
 **已知局限**：
 
-- 不支持 **MKV/WebM**（EBML）与 **OGG**（需按页解析），这两类返回 `None`
+- **OGG 视频（Theora）不支持**：它的 granule 编码了帧号与关键帧偏移，换算规则另有一套，返回 `None`
+- **直播录制的 WebM/MKV 常无 `Duration`**（流式写入来不及回填），这类返回 `None`；
+  要覆盖只能扫到最后一个 Cluster 的 timestamp 反推，代价大，暂不做
 - MP4 若未做 faststart 且 `moov` 大于 4MB，尾部采样可能覆盖不到 → 返回 `None`
 - VBR MP3 若无 Xing / Info 头，只能按平均比特率估算，存在误差
-- 已入库的旧文件没有时长，重新 PUT 一次即可补上（MKV / OGG 补不上）
+- 已入库的旧文件没有时长，重新 PUT 一次即可补上
 
 ---
 

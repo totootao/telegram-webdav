@@ -278,9 +278,63 @@ def _mk_mp3(frames=100):
     return hdr + b"\x00" * 32 + xing + b"\x00" * 64
 
 
+def _vint_size(n):
+    """编码 EBML 的 Size（尽量用最少的字节）。标记位在第 7*L 位。"""
+    for L in range(1, 9):
+        if n < (1 << (7 * L)) - 1:
+            return (n | (1 << (7 * L))).to_bytes(L, "big")
+    return None
+
+
+def _ebml(eid_bytes, payload):
+    return eid_bytes + _vint_size(len(payload)) + payload
+
+
+def _mk_mkv(doctype=b"matroska", scale=1000000, dur_units=180000.0):
+    """最小合法 Matroska/WebM：Segment→Info 里带 TimestampScale 与 Duration。
+
+    Duration 单位是 TimestampScale，故 秒 = dur_units * scale / 1e9
+    """
+    ts = _ebml(b"\x2a\xd7\xb1", scale.to_bytes(3, "big"))
+    du = _ebml(b"\x44\x89", struct.pack(">d", dur_units))
+    info = _ebml(b"\x15\x49\xa9\x66", ts + du)
+    seg = _ebml(b"\x18\x53\x80\x67", info)
+    hdr = _ebml(b"\x1a\x45\xdf\xa3", _ebml(b"\x42\x82", doctype))
+    return hdr + seg
+
+
+def _ogg_page_bytes(htype, granule, seq, segments, data, serial=b"\x78\x56\x34\x12"):
+    nseg = len(segments)
+    return (b"OggS" + bytes([0, htype]) + granule.to_bytes(8, "little", signed=True)
+            + serial + seq.to_bytes(4, "little") + b"\x00\x00\x00\x00"
+            + bytes([nseg]) + bytes(segments) + data)
+
+
+def _mk_ogg_opus(dur=5.0, pre_skip=312, rate=48000):
+    """Opus：granule 恒定按 48kHz 计，且要减掉 pre_skip。"""
+    granule = int(rate * dur) + pre_skip
+    idpkt = (b"OpusHead" + bytes([1, 2]) + pre_skip.to_bytes(2, "little")
+             + rate.to_bytes(4, "little") + b"\x00\x00" + bytes([0]))
+    p1 = _ogg_page_bytes(0x02, 0, 0, [len(idpkt)], idpkt)          # BOS
+    p2 = _ogg_page_bytes(0x04, granule, 1, [10], b"\x00" * 10)     # EOS
+    return p1 + p2
+
+
+def _mk_ogg_vorbis(dur=3.0, rate=44100):
+    """Vorbis：granule 是 PCM 采样数，采样率在 ID header 的 12:16。"""
+    granule = int(rate * dur)
+    idpkt = (b"\x01vorbis" + struct.pack("<I", 0) + bytes([2])
+             + struct.pack("<I", rate) + struct.pack("<iii", 0, 0, 0) + b"\xb8\x01")
+    p1 = _ogg_page_bytes(0x02, 0, 0, [len(idpkt)], idpkt)          # BOS
+    p2 = _ogg_page_bytes(0x04, granule, 1, [10], b"\x00" * 10)     # EOS
+    return p1 + p2
+
+
 req("MKCOL", "/media")
 for _nm, _data in (("a.wav", _mk_wav()), ("b.flac", _mk_flac()),
-                   ("c.mp4", _mk_mp4()), ("d.mp3", _mk_mp3())):
+                   ("c.mp4", _mk_mp4()), ("d.mp3", _mk_mp3()),
+                   ("f.mkv", _mk_mkv()), ("g.webm", _mk_mkv(b"webm", dur_units=90000.0)),
+                   ("h.opus", _mk_ogg_opus()), ("i.ogg", _mk_ogg_vorbis())):
     st, h, b = req("PUT", "/media/" + _nm, body=_data,
                    headers={"Content-Type": "application/octet-stream"})
     check(f"media.put.{_nm}(201)", st == 201, f"status={st}")
@@ -298,6 +352,14 @@ _mp3exp = 100 * 1152 / 44100
 check("media.mp3.duration(xing)",
       _dur("/media/d.mp3") is not None and abs(_dur("/media/d.mp3") - _mp3exp) < 0.01,
       f"got={_dur('/media/d.mp3')} exp={_mp3exp}")
+# EBML(MKV/WebM)：Duration 单位是 TimestampScale，需换算成秒
+check("media.mkv.duration(180.0s)", _dur("/media/f.mkv") == 180.0, f"got={_dur('/media/f.mkv')}")
+check("media.webm.duration(90.0s)", _dur("/media/g.webm") == 90.0, f"got={_dur('/media/g.webm')}")
+# OGG：Opus 的 granule 按 48kHz 计且要减 pre_skip；Vorbis 的 granule 是采样数
+check("media.opus.duration(5.0s)", _dur("/media/h.opus") is not None
+      and abs(_dur("/media/h.opus") - 5.0) < 0.01, f"got={_dur('/media/h.opus')}")
+check("media.vorbis.duration(3.0s)", _dur("/media/i.ogg") is not None
+      and abs(_dur("/media/i.ogg") - 3.0) < 0.01, f"got={_dur('/media/i.ogg')}")
 # 非媒体文件不应解析出时长（也不能误判）
 req("PUT", "/media/e.bin", body=b"not a media file" * 256,
     headers={"Content-Type": "application/octet-stream"})
