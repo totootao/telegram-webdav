@@ -17,6 +17,7 @@
 TG_API_BASE：可指向自建代理（国内/被墙场景），所有请求加该前缀。
 """
 import base64
+import datetime
 import json
 import threading
 import time
@@ -28,6 +29,16 @@ import uuid
 
 class TGError(Exception):
     pass
+
+
+def _log(msg):
+    """统一的后台日志：带本地时间戳 + [tg] 模块前缀，便于定位。
+
+    所有 Telegram 交互（上传 / 下载 / 代理连接 / 重试）都经过这里打印，
+    连接失败、API 报错、文件头异常等都能在日志里看到具体原因。
+    """
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}][tg] {msg}", flush=True)
 
 
 def _mp_boundary():
@@ -91,6 +102,9 @@ class TelegramBackend:
         self._path_cache_ttl = 50 * 60  # TG file_path 有效期 1h，缓存 50min
         self._slot_lock = threading.Lock()
         self._slot_cursor = 0
+        _log(f"TelegramBackend 初始化: api_base={self.api_base} slots={len(self.slots)} "
+             f"rate_limit={self.rate_limit}s rotate={self.rotate} "
+             f"proxy_auth={'on' if self.proxy_token else 'off'}")
 
     def _next_slot(self):
         """轮转取下一个起始槽位（线程安全）。"""
@@ -136,6 +150,7 @@ class TelegramBackend:
         的 dav_gateway 把 ``file_name`` 一路透传到后端）。
         """
         if not self.slots:
+            _log("upload_chunk 失败: Telegram 未配置（slots 为空）")
             raise TGError("Telegram 未配置（设置 TG_BOT_TOKEN/TG_CHAT_ID 或 TG_BOT_POOLS）")
         n = len(self.slots)
         # 轮转分摊：未指定槽位时从游标处开始，让分片均匀落到各个 bot/频道。
@@ -143,6 +158,8 @@ class TelegramBackend:
         start = (prefer_slot % n) if prefer_slot is not None else (
             self._next_slot() if self.rotate else 0
         )
+        _log(f"upload_chunk 启动: file={file_name!r} size={len(data)}B "
+             f"rotate={self.rotate} start_slot={start} total_slots={n}")
         tried = set()
         idx = start
         last_err = None
@@ -154,21 +171,28 @@ class TelegramBackend:
             self._rate_wait(idx)
             try:
                 fid, mid = self._send_document(slot, data, fname)
+                _log(f"upload_chunk 成功: slot={idx} file_id={fid} message_id={mid}")
                 return fid, idx, mid
             except TGError as e:
                 last_err = e
                 msg = str(e)
+                _log(f"upload_chunk 槽位 {idx} 失败: {msg}")
                 # 429 / 限流：换下一个未试过的槽位
                 if "429" in msg or "Too Many Requests" in msg or "flood" in msg.lower():
                     idx = (idx + 1) % n
                     if idx in tried:
+                        _log("upload_chunk 所有槽位均已尝试，限流重试结束")
                         break
+                    _log(f"upload_chunk 因限流切换到槽位 {idx}")
                     continue
                 # 其他错误：也试下一个槽位（最多一轮）
                 idx = (idx + 1) % n
                 if idx in tried:
+                    _log("upload_chunk 所有槽位均已尝试，结束")
                     break
+                _log(f"upload_chunk 切换到槽位 {idx}")
                 continue
+        _log(f"upload_chunk 最终失败: {last_err}")
         raise TGError("分片上传失败: " + (str(last_err) if last_err else "未知错误"))
 
     def _send_document(self, slot, data, file_name="part.bin", retries=3):
@@ -182,12 +206,27 @@ class TelegramBackend:
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
         self._prepare(req)
+        _log(f"sendDocument 开始: file={file_name!r} size={len(data)}B "
+             f"chat_id={slot['chat_id']} api={self.api_base}")
         last = None
         for attempt in range(retries):
             try:
                 with urllib.request.urlopen(req, timeout=240) as resp:
-                    js = json.loads(resp.read().decode("utf-8", "replace"))
+                    raw = resp.read().decode("utf-8", "replace")
+                try:
+                    js = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    # 文件头异常 / 非 JSON 响应（如代理返回 HTML 错误页）
+                    _log(f"sendDocument 响应解析失败（非 JSON）: attempt={attempt + 1} "
+                         f"err={e} body_head={raw[:160]!r}")
+                    last = f"响应非 JSON: {raw[:160]}"
+                    if attempt < retries - 1:
+                        time.sleep(min(30, 2 ** attempt))
+                        continue
+                    raise TGError(last)
                 if not js.get("ok"):
+                    _log(f"sendDocument 业务失败: code={js.get('error_code')} "
+                         f"desc={js.get('description')} attempt={attempt + 1}")
                     raise TGError(f"{js.get('error_code')} {js.get('description')}")
                 result = js["result"]
                 doc = (
@@ -198,11 +237,17 @@ class TelegramBackend:
                 )
                 fid = doc.get("file_id")
                 if not fid:
+                    _log(f"sendDocument 响应缺少 file_id: attempt={attempt + 1} "
+                         f"result={json.dumps(result)[:200]}")
                     raise TGError("响应中缺少 file_id: " + json.dumps(result)[:200])
+                _log(f"sendDocument 成功: file={file_name!r} file_id={fid} "
+                     f"message_id={result.get('message_id')}")
                 return fid, result.get("message_id")
             except urllib.error.HTTPError as e:
                 text = e.read().decode("utf-8", "replace")
                 last = f"HTTP {e.code} {text[:160]}"
+                _log(f"sendDocument HTTP 错误: code={e.code} attempt={attempt + 1}/{retries} "
+                     f"url={url} body={text[:200]!r}")
                 if e.code == 429:
                     ra = 1
                     try:
@@ -210,6 +255,7 @@ class TelegramBackend:
                         ra = int(d.get("parameters", {}).get("retry_after", 1) or 1)
                     except Exception:
                         pass
+                    _log(f"sendDocument 触发限流(429)，等待 {ra}s 后重试")
                     time.sleep(max(ra, 1))
                     continue
                 if attempt < retries - 1:
@@ -220,6 +266,8 @@ class TelegramBackend:
                 raise
             except Exception as e:  # 网络错误：退避重试
                 last = f"network: {e}"
+                _log(f"sendDocument 网络错误: {type(e).__name__}: {e} attempt={attempt + 1}/{retries} "
+                     f"api={self.api_base}")
                 if attempt < retries - 1:
                     time.sleep(min(30, 2 ** attempt))
                     continue
@@ -231,26 +279,45 @@ class TelegramBackend:
         now = time.time()
         cached = self._path_cache.get(file_id)
         if cached and cached[1] > now:
+            _log(f"getFile 命中缓存: file_id={file_id} path={cached[0]}")
             return cached[0]
         url = self._api_url(token, "getFile") + "?file_id=" + urllib.parse.quote(file_id)
+        _log(f"getFile 请求: file_id={file_id} api={self.api_base}")
         for attempt in range(3):
             try:
                 req = self._prepare(urllib.request.Request(url))
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    js = json.loads(resp.read().decode("utf-8", "replace"))
+                    raw = resp.read().decode("utf-8", "replace")
+                try:
+                    js = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    _log(f"getFile 响应解析失败（非 JSON）: attempt={attempt + 1} "
+                         f"err={e} body_head={raw[:160]!r}")
+                    if attempt < 2:
+                        time.sleep(2)
+                        continue
+                    raise TGError(f"getFile 响应非 JSON: {raw[:160]}")
                 if not js.get("ok"):
+                    _log(f"getFile 业务失败: code={js.get('error_code')} "
+                         f"desc={js.get('description')} attempt={attempt + 1}")
                     raise TGError(f"getFile: {js.get('error_code')} {js.get('description')}")
                 fp = js["result"]["file_path"]
                 self._path_cache[file_id] = (fp, now + self._path_cache_ttl)
+                _log(f"getFile 成功: file_id={file_id} path={fp}")
                 return fp
             except urllib.error.HTTPError as e:
+                text = e.read().decode("utf-8", "replace")
+                _log(f"getFile HTTP 错误: code={e.code} attempt={attempt + 1}/3 "
+                     f"file_id={file_id} body={text[:200]!r}")
                 if e.code == 429:
                     time.sleep(2)
                     continue
-                raise TGError(f"getFile HTTP {e.code}")
+                raise TGError(f"getFile HTTP {e.code}: {text[:160]}")
             except TGError:
                 raise
             except Exception as e:
+                _log(f"getFile 网络/其他错误: {type(e).__name__}: {e} attempt={attempt + 1}/3 "
+                     f"file_id={file_id} api={self.api_base}")
                 if attempt < 2:
                     time.sleep(2)
                     continue
@@ -264,15 +331,30 @@ class TelegramBackend:
         fp = self._get_file_path(file_id, token)
         url = self._file_url(token, fp)
         req = self._prepare(urllib.request.Request(url))
+        rng = None
         if start is not None:
             rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
             req.add_header("Range", rng)
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            while True:
-                b = resp.read(blk)
-                if not b:
-                    break
-                yield b
+        _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} url={url}")
+        total_yield = 0
+        try:
+            with urllib.request.urlopen(req, timeout=180) as resp:
+                while True:
+                    b = resp.read(blk)
+                    if not b:
+                        break
+                    total_yield += len(b)
+                    yield b
+            _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield}")
+        except urllib.error.HTTPError as e:
+            text = e.read().decode("utf-8", "replace") if e.fp else ""
+            _log(f"iter_chunk HTTP 错误: code={e.code} file_id={file_id} range={rng} "
+                 f"body={text[:200]!r}")
+            raise TGError(f"iter_chunk HTTP {e.code}: {text[:160]}")
+        except Exception as e:
+            _log(f"iter_chunk 网络/其他错误: {type(e).__name__}: {e} file_id={file_id} "
+                 f"range={rng} api={self.api_base}")
+            raise TGError(f"iter_chunk: {e}")
 
     # ---------- webhook 入站消息解析（参考 getTelegramFileFromMessage） ----------
     @staticmethod

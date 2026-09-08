@@ -42,6 +42,17 @@ import media as _media
 import tg as _tg
 
 
+def _log(msg):
+    """统一的后台日志：带本地时间戳 + [webdav] 模块前缀，便于定位。
+
+    请求级事件（PUT 收到、父目录校验、上传成败、文件落库）与异常兜底都经过这里，
+    配合 [tg] 侧的 Telegram 交互日志，可完整还原一次上传/下载失败的根因。
+    """
+    import datetime
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}][webdav] {msg}", flush=True)
+
+
 def _now_http(ts):
     return email.utils.formatdate(ts, usegmt=True)
 
@@ -163,18 +174,25 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         try:
             super().handle_one_request()
         except (ConnectionError, TimeoutError, socket.timeout):
+            # 客户端断开 / 空闲超时回收：正常行为，静默关闭，不刷日志
             self.close_connection = True
             return
         except Exception as e:  # noqa: BLE001
             if _is_timeout_err(e):
                 self.close_connection = True
                 return
+            # 未捕获的异常：记录具体类型与原因，回 500 但绝不吐 traceback/HTML 给客户端
+            import traceback
+            _log(f"未捕获异常(返回500): 请求={getattr(self, 'command', '?')} "
+                 f"{getattr(self, 'path', '?')} 异常={type(e).__name__}: {e}\n"
+                 f"    traceback={''.join(traceback.format_exception_only(type(e), e))!s:.200}".rstrip())
             self._send_error(500, f"internal error: {type(e).__name__}")
             self.close_connection = True
         finally:
             try:
                 self._drain_body()
-            except Exception:
+            except Exception as e:
+                _log(f"请求收尾时 _drain_body 异常(关闭连接): {type(e).__name__}: {e}")
                 self.close_connection = True
 
     def send_response(self, code, message=None):
@@ -611,20 +629,25 @@ class WebDAVHandler(BaseHTTPRequestHandler):
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
         if path is None:
+            _log(f"GET 拒绝(404): 路径非法/越权 path={self.path!r}")
             self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         node = self.app.db.get_node(path)
         if node is None:
+            _log(f"GET 拒绝(404): 节点不存在 path={path}")
             self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         if node["is_dir"]:
             # 目录：重定向到带尾斜杠的形式（浏览器/Windows 相对路径更稳）
+            _log(f"GET 目录重定向(301): path={path} -> {self._href(path, True)}")
             self._send(
                 301,
                 {"Location": self._href(path, True)},
                 b"301 Moved Permanently",
             )
             return
+        _log(f"GET 开始{' (HEAD)' if head_only else ''}: path={path} size={node['size']} "
+             f"分片数={len(node.get('chunks') or [])} Range={self.headers.get('Range')}")
 
         total = node["size"]
         chunks = json.loads(node["chunks"]) if node.get("chunks") else []
@@ -707,12 +730,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         except _IntegrityError as e:
             # 分片内容与上传时记录的不一致（Telegram 返回了损坏/截断的字节，或数据被污染）：
             # 已经可能发了一部分脏数据，立刻中断连接，绝不把错数据当完整文件交给客户端。
-            print(f"[webdav] 分片完整性校验失败 {path} @offset {e.offset}: "
-                  f"内容不符或被截断", flush=True)
+            _log(f"GET 分片完整性校验失败(中断连接): path={path} @offset {e.offset} "
+                 f"说明=内容不符或被截断（Telegram 返回字节与原 file_id 记录的 sha256 不符）")
             self.close_connection = True
             return
         except _tg.TGError as e:
-            print(f"[webdav] 下载分片失败 {path}: {e}", flush=True)
+            _log(f"GET 下载分片失败(连接中断): path={path} 错误={e}")
             self.close_connection = True
 
     # ---------------- PUT ----------------
@@ -721,17 +744,24 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None:
+            _log(f"PUT 拒绝(403): 路径非法/越权 path={self.path!r}")
             self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         if self.app.backend is None:
+            _log(f"PUT 拒绝(503): Telegram 未配置（backend=None）path={path}")
             self._send(503, {"Content-Type": "text/plain; charset=utf-8"},
                        "Telegram 未配置，无法存储".encode("utf-8"))
             return
+        _log(f"PUT 收到: path={path} Content-Length={self.headers.get('Content-Length')} "
+             f"Transfer-Encoding={self.headers.get('Transfer-Encoding')} "
+             f"Content-Type={self.headers.get('Content-Type')} "
+             f"Expect={self.headers.get('Expect')}")
 
         # 条件头：If-None-Match: * 表示「仅当不存在时创建」
         if_none = self.headers.get("If-None-Match", "")
         existed = self.app.db.get_node(path) is not None
         if if_none == "*" and existed:
+            _log(f"PUT 拒绝(412): 已存在且 If-None-Match:* path={path}")
             self._send(412, {"Content-Type": "text/plain; charset=utf-8"},
                        b"412 Precondition Failed (already exists)")
             return
@@ -739,6 +769,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         parent = "/" if path == "/" else path.rsplit("/", 1)[0] or "/"
         pnode = self.app.db.get_node(parent)
         if pnode is None or not pnode["is_dir"]:
+            _log(f"PUT 拒绝(409): 父目录不存在或非目录 path={path} parent={parent} "
+                 f"parent_node={'缺失' if pnode is None else '存在但非目录'}")
             self._send(409, {"Content-Type": "text/plain; charset=utf-8"})  # Conflict: 父目录不存在
             return
 
@@ -758,16 +790,24 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             # 有 Content-Length：按精确长度读取
             body_data = b""
             if total > 0:
+                _log(f"PUT 读取请求体: 模式=Content-Length size={total}B")
                 body_data = self._read_exact(total)
                 if len(body_data) != total:
+                    _log(f"PUT 请求体长度不足(客户端提前断开): 期望 {total}B 实际收到 {len(body_data)}B "
+                         f"path={path}")
                     raise _tg.TGError("请求体长度不足（客户端提前断开）")
         elif "chunked" in te:
             # chunked 编码：读全部块后拼接
+            _log(f"PUT 读取请求体: 模式=chunked")
             body_data = self._read_chunked()
             total = len(body_data)
+            _log(f"PUT chunked 读取完成: size={total}B")
         else:
             # 既无 CL 也非 chunked：对 PUT 方法尝试流式读取直到 EOF（短连接）
             # 注意：keep-alive 下无法安全判断 EOF，此处做最大努力读取
+            _log(f"PUT 读取请求体: 模式=流式(无 Content-Length/Transfer-Encoding) "
+                 f"path={path} keepalive={self.app.config.keepalive} "
+                 f"注:keep-alive 下可能读不到 EOF，将按最大努力读取")
             body_data = b""
             try:
                 while True:
@@ -783,6 +823,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
             total = len(body_data)
+            _log(f"PUT 流式读取完成: size={total}B")
 
         ct = self.headers.get("Content-Type", "").split(";")[0].strip()
         if not ct:
@@ -824,7 +865,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 ci += 1
             # 清理残留字节（AList 类 CL 少算），必要时关闭连接
             self._drain_residual()
+            _log(f"PUT 分片上传完成: path={path} 分片数={ci} 总大小={total}B "
+                 f"chunk_size={chunk_size}B")
         except _tg.TGError as e:
+            _log(f"PUT 上传到 Telegram 失败(返回502): path={path} 已上传分片={ci}/{ci} "
+                 f"total={total}B 错误={e}")
             self._send(502, {"Content-Type": "text/plain; charset=utf-8"},
                        f"上传到 Telegram 失败: {e}".encode("utf-8"))
             return
@@ -837,15 +882,27 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 duration = _media.probe_duration(
                     head_sample, tail_sample, total, path.rsplit("/", 1)[-1]
                 )
-            except Exception:
+            except Exception as e:
+                # 文件头异常（非媒体 / 截断 / 格式无法解析）：仅影响时长元数据，不影响上传
+                _log(f"PUT 媒体时长解析异常(已忽略,不影响上传): path={path} err={type(e).__name__}: {e}")
                 duration = None
 
-        self.app.db.create_file(
-            path, ct, chunks_meta if total > 0 else [], total,
-            chunk_size=chunk_size if total > 0 else None,
-            file_hash=file_hash.hexdigest() if total > 0 else None,
-            duration=duration,
-        )
+        try:
+            self.app.db.create_file(
+                path, ct, chunks_meta if total > 0 else [], total,
+                chunk_size=chunk_size if total > 0 else None,
+                file_hash=file_hash.hexdigest() if total > 0 else None,
+                duration=duration,
+            )
+        except Exception as e:
+            _log(f"PUT 落库失败(返回500): path={path} 分片数={len(chunks_meta)} total={total} "
+                 f"err={type(e).__name__}: {e}")
+            self._send(500, {"Content-Type": "text/plain; charset=utf-8"},
+                       f"元数据写入失败: {e}".encode("utf-8"))
+            return
+        _log(f"PUT 完成: path={path} 状态={'覆盖(204)' if existed else '新建(201)'} "
+             f"size={total}B 分片数={len(chunks_meta)} content_type={ct} "
+             f"duration={duration} file_hash={'有' if total > 0 else '无(空文件)'}")
         self._send(204 if existed else 201, {"Content-Type": "text/plain"})
 
     # ---------------- DELETE ----------------

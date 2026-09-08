@@ -18,12 +18,23 @@ nodes 表即一个虚拟文件系统：
   这样既消除了多连接之间的锁互相等待，又把锁的语义收拢到 Python 层，行为确定、可预期。
 """
 
+import datetime
 import json
 import os
 import sqlite3
 import threading
 import time
 import uuid
+
+
+def _log(msg):
+    """统一的后台日志：带本地时间戳 + [db] 模块前缀。
+
+    聚焦「数据库层本身」的异常：连接失败（权限/磁盘满/文件损坏）、
+    schema 初始化失败、写事务被锁死（busy）等，便于把问题从 WebDAV 层分离出来。
+    """
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}][db] {msg}", flush=True)
 
 
 class MetaStore:
@@ -33,16 +44,28 @@ class MetaStore:
         d = os.path.dirname(os.path.abspath(path))
         if d and not os.path.isdir(d):
             os.makedirs(d, exist_ok=True)
-        self._conn = self._open()
+        try:
+            self._conn = self._open()
+        except Exception as e:
+            _log(f"SQLite 连接失败(致命): path={path} 异常={type(e).__name__}: {e}")
+            raise
         self._init_db()
 
     # ---------- 连接（单例，线程安全由 self._lock 保证） ----------
     def _open(self):
-        conn = sqlite3.connect(self.path, timeout=60, check_same_thread=False)
+        try:
+            conn = sqlite3.connect(self.path, timeout=60, check_same_thread=False)
+        except Exception as e:
+            _log(f"无法打开 SQLite 文件: path={self.path} 异常={type(e).__name__}: {e}")
+            raise
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=60000")
-        conn.execute("PRAGMA synchronous=NORMAL")
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception as e:
+            _log(f"设置 PRAGMA 失败(忽略): {type(e).__name__}: {e}")
+        _log(f"SQLite 已连接: path={self.path}")
         return conn
 
     def close(self):
