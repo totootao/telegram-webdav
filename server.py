@@ -21,7 +21,7 @@ def main():
     print("=" * 48)
     print("配置:", json.dumps(cfg.summary(), ensure_ascii=False, indent=2))
     if not srv.app.backend:
-        print("[警告] 未检测到 Telegram 配置（TG_BOT_TOKEN / TG_CHAT_ID）。")
+        print("[警告] 未检测到 Telegram 配置（TG_BOT_TOKEN / TG_CHAT_ID 或 TG_BOT_POOLS）。")
         print("         PUT 上传会返回 503。请配置后再上传；PROPFIND/GET/目录操作可正常用。")
     print(f"监听: http://{cfg.host}:{cfg.port}")
     print(f"导入目录(webhook): {cfg.import_dir}")

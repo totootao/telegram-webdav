@@ -2,11 +2,18 @@
 
 参考 otterhub-server 的 .env.example：
   - TG_BOT_TOKEN / TG_CHAT_ID          单 bot 模式（频道/群组 chat_id，可为 @channel 或 -100xxxx）
-  - TG_BOT_POOLS                       多 bot 池（JSON 数组：[{"token","chatId"}]），分摊 1 msg/s 流控
-  - TG_API_BASE                        自建 Telegram API 代理基址（国内/被墙环境），可选
+  - TG_BOT_POOLS                       多 bot 池（JSON 数组：[{"token","chatId",
+                                        "apiBase"(可选),"proxyToken"(可选)}]），分摊 1 msg/s 流控
+  - TG_API_BASE                        自建 Telegram API 代理基址（国内/被墙环境），可选；
+                                        作为 TG_BOT_POOLS 各槽位缺省 apiBase 的全局回退
+  - TG_PROXY_TOKEN                     自建代理的鉴权令牌，作为各槽位缺省 proxyToken 的全局回退；可选
   - CHUNK_SIZE_MB                      分片大小，默认 20（Telegram Bot API 官方上传上限 20MB / 50MB）
   - DAV_USER / DAV_PASSWORD            WebDAV Basic 认证
   - DB_PATH                            SQLite 数据库路径
+
+设计要点：apiBase / proxyToken 既可以作为全局环境变量（TG_API_BASE / TG_PROXY_TOKEN）统一设置，
+也可以在每个 TG_BOT_POOLS 槽位里单独覆盖（键名 apiBase / proxyToken）。槽位级优先于全局级，
+这样同一个服务里能让不同 bot 走不同代理。
 """
 import os
 import json
@@ -36,7 +43,14 @@ _load_dotenv()
 
 
 def _load_pools():
-    """解析 TG_BOT_POOLS（JSON 数组）或回退到单 bot（TG_BOT_TOKEN / TG_CHAT_ID）。"""
+    """解析 TG_BOT_POOLS（JSON 数组）或回退到单 bot（TG_BOT_TOKEN / TG_CHAT_ID）。
+
+    每个槽位支持：
+        {"token", "chatId"/"chat_id",
+         "apiBase"/"api_base"(可选), "proxyToken"/"proxy_token"(可选)}
+    - apiBase / proxyToken 缺省时回退到全局 TG_API_BASE / TG_PROXY_TOKEN。
+    - 这样同一个服务里的不同 bot 可各自走不同的 Telegram API 代理 / 鉴权令牌。
+    """
     raw = os.environ.get("TG_BOT_POOLS")
     pools = []
     if raw and raw.strip():
@@ -44,12 +58,25 @@ def _load_pools():
             parsed = json.loads(raw)
             if isinstance(parsed, list):
                 for it in parsed:
+                    if not isinstance(it, dict):
+                        continue
                     token = str(it.get("token", "")).strip()
                     chat_id = str(it.get("chatId") or it.get("chat_id") or "").strip()
                     if token and chat_id:
-                        pools.append({"token": token, "chat_id": chat_id})
+                        slot = {"token": token, "chat_id": chat_id}
+                        api_base = str(
+                            it.get("apiBase") or it.get("api_base") or ""
+                        ).strip()
+                        if api_base:
+                            slot["api_base"] = api_base.rstrip("/")
+                        proxy_token = str(
+                            it.get("proxyToken") or it.get("proxy_token") or ""
+                        ).strip()
+                        if proxy_token:
+                            slot["proxy_token"] = proxy_token
+                        pools.append(slot)
         except Exception:
-            # 简化格式：token|chatId,token|chatId
+            # 简化格式：token|chatId,token|chatId（不支持 per-slot 的 apiBase/proxyToken）
             for part in raw.split(","):
                 seg = part.strip()
                 if not seg:
@@ -69,11 +96,13 @@ class Config:
     def __init__(self):
         self.db_path = os.environ.get("DB_PATH", "./telegram_webdav.db")
         self.chunk_size = int(os.environ.get("CHUNK_SIZE_MB", "20")) * 1024 * 1024
+        # 全局默认 API 基址：作为 TG_BOT_POOLS 各槽位未单独指定 apiBase 时的回退。
         self.api_base = os.environ.get(
             "TG_API_BASE", "https://api.telegram.org"
         ).rstrip("/")
         # 自建 Telegram API 代理（如 tg.<domain>/tg）若额外要求认证，用此令牌
         # 以 Authorization: Bearer <token> 头发送；官方 api.telegram.org 下不需要，留空即可。
+        # 同样作为 TG_BOT_POOLS 各槽位未单独指定 proxyToken 时的回退。
         self.proxy_token = (os.environ.get("TG_PROXY_TOKEN") or "").strip()
         self.slots = _load_pools()
         self.auth_user = os.environ.get("DAV_USER")

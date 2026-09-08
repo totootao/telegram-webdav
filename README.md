@@ -158,9 +158,9 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | --- | --- | --- |
 | `TG_BOT_TOKEN` | bot token（单 bot 模式） | 空 |
 | `TG_CHAT_ID` | 频道/群组 chat_id（单 bot 模式） | 空 |
-| `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId"}]`；分摊 1 msg/s 流控 | 空 |
-| `TG_API_BASE` | Telegram API 代理基址（国内/被墙用） | `https://api.telegram.org` |
-| `TG_PROXY_TOKEN` | 自建代理的鉴权令牌，以 `Authorization: Bearer` 头发出；官方 API 场景留空 | 空 |
+| `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId","apiBase"(可选),"proxyToken"(可选)}]`；分摊 1 msg/s 流控。`apiBase`/`proxyToken` 缺省时回退全局变量 | 空 |
+| `TG_API_BASE` | 全局 Telegram API 代理基址（国内/被墙用），作为各 bot 未单独指定 `apiBase` 时的默认回退 | `https://api.telegram.org` |
+| `TG_PROXY_TOKEN` | 全局代理鉴权令牌，以 `Authorization: Bearer` 头发出，作为各 bot 未单独指定 `proxyToken` 时的默认回退；官方 API 场景留空 | 空 |
 | `CHUNK_SIZE_MB` | 分片大小（≤20 即可走官方 Bot API；自建 Bot API Server 可到 2000） | `20` |
 | `DB_PATH` | SQLite 文件路径 | `./telegram_webdav.db` |
 | `DAV_USER` / `DAV_PASSWORD` | Basic 认证（建议必填） | 空（关闭认证） |
@@ -226,7 +226,18 @@ docker run -d --name tg-webdav \
   totootao/telegram-webdav:latest
 ```
 - 数据（SQLite）落在容器 `/data`，建议挂卷持久化。
-- 多 bot 池：`TG_BOT_POOLS='[{"token":"...","chatId":"-100..."}]'`。
+- 多 bot 池（每项可单独带 `apiBase`/`proxyToken`）：
+
+```bash
+docker run -d --name tg-webdav \
+  -p 8080:8080 \
+  -v tg-webdav-data:/data \
+  -e DAV_USER=alice -e DAV_PASSWORD=secret \
+  -e 'TG_BOT_POOLS=[{"token":"111:AAA","chatId":"-100xxx"},
+                     {"token":"222:BBB","chatId":"-100yyy","apiBase":"https://proxy2/tg","proxyToken":"tok2"}]' \
+  totootao/telegram-webdav:latest
+```
+  未在某 bot 写 `apiBase`/`proxyToken` 时，自动回退到全局 `TG_API_BASE`/`TG_PROXY_TOKEN`。
 
 ### 多 bot 池的分片分配
 

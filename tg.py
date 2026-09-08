@@ -89,10 +89,10 @@ def _build_multipart(boundary, fields, files):
 class TelegramBackend:
     def __init__(self, slots, api_base="https://api.telegram.org", rate_limit=1.0,
                  proxy_token=None, rotate=True):
-        self.slots = slots  # [{"token","chat_id"}]
-        self.api_base = api_base.rstrip("/")
+        self.slots = slots  # [{"token","chat_id","api_base"(可选),"proxy_token"(可选)}]
+        self.api_base = api_base.rstrip("/")  # 全局默认 API 基址（槽位级可覆盖）
         self.rate_limit = float(rate_limit)
-        # 自建 TG API 代理需要的访问令牌（官方 API 场景留空）
+        # 自建 TG API 代理需要的访问令牌（官方 API 场景留空）——全局默认，槽位级可覆盖
         self.proxy_token = (proxy_token or "").strip() or None
         # 多 bot 池时是否轮转分摊（关掉则固定优先用第一个槽位 = 主备模式）
         self.rotate = bool(rotate)
@@ -102,9 +102,14 @@ class TelegramBackend:
         self._path_cache_ttl = 50 * 60  # TG file_path 有效期 1h，缓存 50min
         self._slot_lock = threading.Lock()
         self._slot_cursor = 0
-        _log(f"TelegramBackend 初始化: api_base={self.api_base} slots={len(self.slots)} "
+        _log(f"TelegramBackend 初始化: slots={len(self.slots)} "
              f"rate_limit={self.rate_limit}s rotate={self.rotate} "
-             f"proxy_auth={'on' if self.proxy_token else 'off'}")
+             f"global_api_base={self.api_base} global_proxy_auth={'on' if self.proxy_token else 'off'}")
+        for i, s in enumerate(self.slots):
+            sb = s.get("api_base") or self.api_base
+            st = s.get("proxy_token") or self.proxy_token
+            _log(f"  槽位 {i}: chat_id={s['chat_id']} api_base={sb} "
+                 f"proxy_auth={'on' if st else 'off'}")
 
     def _next_slot(self):
         """轮转取下一个起始槽位（线程安全）。"""
@@ -113,22 +118,35 @@ class TelegramBackend:
             self._slot_cursor = (idx + 1) % len(self.slots)
             return idx
 
+    # ---------- 每槽位的 api_base / proxy_token 解析 ----------
+    def _slot_api_base(self, slot):
+        """取该槽位实际使用的 API 基址：优先槽位自带，回退全局默认。"""
+        return (slot.get("api_base") or self.api_base).rstrip("/")
+
+    def _slot_proxy_token(self, slot):
+        """取该槽位实际使用的代理令牌：优先槽位自带，回退全局默认。"""
+        return slot.get("proxy_token") or self.proxy_token
+
     # ---------- URL / 认证 ----------
-    def _api_url(self, token, method):
-        return f"{self.api_base}/bot{token}/{method}"
+    def _api_url(self, token, method, api_base=None):
+        base = (api_base or self.api_base).rstrip("/")
+        return f"{base}/bot{token}/{method}"
 
-    def _file_url(self, token, file_path):
-        return f"{self.api_base}/file/bot{token}/{file_path}"
+    def _file_url(self, token, file_path, api_base=None):
+        base = (api_base or self.api_base).rstrip("/")
+        return f"{base}/file/bot{token}/{file_path}"
 
-    def _prepare(self, req):
+    def _prepare(self, req, proxy_token=None):
         """统一装配请求：代理鉴权 + 自定义 UA。
 
         urllib 默认的 ``Python-urllib/x.y`` 会被 Cloudflare 等 WAF 直接 403
-        （error code 1010），所以这里换成固定的 UA。
+        （error code 1010），所以这里换成固定的 UA。``proxy_token`` 缺省时
+        回退到全局/槽位默认；调用方传入槽位级令牌即可实现「不同 bot 走不同代理」。
         """
         req.add_header("User-Agent", "TelegramWebDAV/1.0 (+python-urllib)")
-        if self.proxy_token:
-            req.add_header("Authorization", f"Bearer {self.proxy_token}")
+        tk = proxy_token if proxy_token is not None else self.proxy_token
+        if tk:
+            req.add_header("Authorization", f"Bearer {tk}")
         return req
 
     # ---------- 限流 ----------
@@ -196,18 +214,21 @@ class TelegramBackend:
         raise TGError("分片上传失败: " + (str(last_err) if last_err else "未知错误"))
 
     def _send_document(self, slot, data, file_name="part.bin", retries=3):
+        api_base = self._slot_api_base(slot)
+        proxy_token = self._slot_proxy_token(slot)
         boundary = _mp_boundary()
         body = _build_multipart(
             boundary,
             [("chat_id", slot["chat_id"]), ("disable_content_type_detection", "true")],
             [("document", file_name, "application/octet-stream", data)],
         )
-        url = self._api_url(slot["token"], "sendDocument")
+        url = self._api_url(slot["token"], "sendDocument", api_base)
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
-        self._prepare(req)
+        self._prepare(req, proxy_token)
         _log(f"sendDocument 开始: file={file_name!r} size={len(data)}B "
-             f"chat_id={slot['chat_id']} api={self.api_base}")
+             f"chat_id={slot['chat_id']} api={api_base} "
+             f"proxy_auth={'on' if proxy_token else 'off'}")
         last = None
         for attempt in range(retries):
             try:
@@ -267,7 +288,7 @@ class TelegramBackend:
             except Exception as e:  # 网络错误：退避重试
                 last = f"network: {e}"
                 _log(f"sendDocument 网络错误: {type(e).__name__}: {e} attempt={attempt + 1}/{retries} "
-                     f"api={self.api_base}")
+                     f"api={api_base}")
                 if attempt < retries - 1:
                     time.sleep(min(30, 2 ** attempt))
                     continue
@@ -275,14 +296,16 @@ class TelegramBackend:
         raise TGError(last or "重试耗尽")
 
     # ---------- 下载 ----------
-    def _get_file_path(self, file_id, token):
+    def _get_file_path(self, file_id, token, api_base=None, proxy_token=None):
         now = time.time()
         cached = self._path_cache.get(file_id)
         if cached and cached[1] > now:
             _log(f"getFile 命中缓存: file_id={file_id} path={cached[0]}")
             return cached[0]
-        url = self._api_url(token, "getFile") + "?file_id=" + urllib.parse.quote(file_id)
-        _log(f"getFile 请求: file_id={file_id} api={self.api_base}")
+        base = (api_base or self.api_base).rstrip("/")
+        url = self._api_url(token, "getFile", base) + "?file_id=" + urllib.parse.quote(file_id)
+        _log(f"getFile 请求: file_id={file_id} api={base} "
+             f"proxy_auth={'on' if proxy_token else 'off'}")
         for attempt in range(3):
             try:
                 req = self._prepare(urllib.request.Request(url))
@@ -317,7 +340,7 @@ class TelegramBackend:
                 raise
             except Exception as e:
                 _log(f"getFile 网络/其他错误: {type(e).__name__}: {e} attempt={attempt + 1}/3 "
-                     f"file_id={file_id} api={self.api_base}")
+                     f"file_id={file_id} api={base}")
                 if attempt < 2:
                     time.sleep(2)
                     continue
@@ -327,15 +350,19 @@ class TelegramBackend:
     def iter_chunk(self, file_id, slot, start=None, end=None, blk=256 * 1024):
         """生成器：按 Range 取回单块字节。start/end 为相对该块的字节区间（含端点）。"""
         n = len(self.slots)
-        token = self.slots[slot % n]["token"]
-        fp = self._get_file_path(file_id, token)
-        url = self._file_url(token, fp)
-        req = self._prepare(urllib.request.Request(url))
+        sd = self.slots[slot % n]
+        token = sd["token"]
+        api_base = self._slot_api_base(sd)
+        proxy_token = self._slot_proxy_token(sd)
+        fp = self._get_file_path(file_id, token, api_base, proxy_token)
+        url = self._file_url(token, fp, api_base)
+        req = self._prepare(urllib.request.Request(url), proxy_token)
         rng = None
         if start is not None:
             rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
             req.add_header("Range", rng)
-        _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} url={url}")
+        _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} url={url} "
+             f"proxy_auth={'on' if proxy_token else 'off'}")
         total_yield = 0
         try:
             with urllib.request.urlopen(req, timeout=180) as resp:
@@ -353,7 +380,7 @@ class TelegramBackend:
             raise TGError(f"iter_chunk HTTP {e.code}: {text[:160]}")
         except Exception as e:
             _log(f"iter_chunk 网络/其他错误: {type(e).__name__}: {e} file_id={file_id} "
-                 f"range={rng} api={self.api_base}")
+                 f"range={rng} api={api_base}")
             raise TGError(f"iter_chunk: {e}")
 
     # ---------- webhook 入站消息解析（参考 getTelegramFileFromMessage） ----------
