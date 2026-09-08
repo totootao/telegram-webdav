@@ -77,16 +77,27 @@ def _build_multipart(boundary, fields, files):
 
 class TelegramBackend:
     def __init__(self, slots, api_base="https://api.telegram.org", rate_limit=1.0,
-                 proxy_token=None):
+                 proxy_token=None, rotate=True):
         self.slots = slots  # [{"token","chat_id"}]
         self.api_base = api_base.rstrip("/")
         self.rate_limit = float(rate_limit)
         # 自建 TG API 代理需要的访问令牌（官方 API 场景留空）
         self.proxy_token = (proxy_token or "").strip() or None
+        # 多 bot 池时是否轮转分摊（关掉则固定优先用第一个槽位 = 主备模式）
+        self.rotate = bool(rotate)
         self._lock = threading.Lock()
         self._last = {}  # slot idx -> 上次发送时间
         self._path_cache = {}  # file_id -> (file_path, expire_ts)
         self._path_cache_ttl = 50 * 60  # TG file_path 有效期 1h，缓存 50min
+        self._slot_lock = threading.Lock()
+        self._slot_cursor = 0
+
+    def _next_slot(self):
+        """轮转取下一个起始槽位（线程安全）。"""
+        with self._slot_lock:
+            idx = self._slot_cursor
+            self._slot_cursor = (idx + 1) % len(self.slots)
+            return idx
 
     # ---------- URL / 认证 ----------
     def _api_url(self, token, method):
@@ -127,7 +138,11 @@ class TelegramBackend:
         if not self.slots:
             raise TGError("Telegram 未配置（设置 TG_BOT_TOKEN/TG_CHAT_ID 或 TG_BOT_POOLS）")
         n = len(self.slots)
-        start = (prefer_slot % n) if prefer_slot is not None else 0
+        # 轮转分摊：未指定槽位时从游标处开始，让分片均匀落到各个 bot/频道。
+        # 若关闭轮转（主备模式）则固定从 0 开始——只有失败/429 才会切到下一个。
+        start = (prefer_slot % n) if prefer_slot is not None else (
+            self._next_slot() if self.rotate else 0
+        )
         tried = set()
         idx = start
         last_err = None

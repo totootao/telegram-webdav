@@ -168,6 +168,7 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_WEBHOOK_SECRET` | 频道入库 webhook 密钥（Telegram 以 `X-Telegram-Bot-Api-Secret-Token` 头发送） | 空 |
 | `WEBDAV_IMPORT_DIR` | webhook 入库落盘目录 | `/telegram-import` |
 | `TG_RATE_LIMIT` | 每 bot 发送最小间隔（秒），防 429 | `1.0` |
+| `TG_SLOT_ROTATE` | 多 bot 池分片是否轮转分摊（`on`=各频道均匀承载；`off`=固定优先第一个，即主备模式） | `on` |
 | `DAV_ROOT` | 把 WebDAV 根挂载到某子路径（默认 `/`），如 `/dav`；href 会自动带此前缀 | `/` |
 | `DAV_KEEPALIVE` | 是否复用 TCP 连接（`on`/`off`）；个别客户端请求体长度数错导致错位时设 `off` | `on` |
 | `DAV_BODY_TIMEOUT` | 请求体读取超时（秒），防止 `Content-Length` 虚高把线程拖死 | `300` |
@@ -226,6 +227,17 @@ docker run -d --name tg-webdav \
 ```
 - 数据（SQLite）落在容器 `/data`，建议挂卷持久化。
 - 多 bot 池：`TG_BOT_POOLS='[{"token":"...","chatId":"-100..."}]'`。
+
+### 多 bot 池的分片分配
+
+配了多个 bot 时，分片默认**轮转分摊**到各频道（`TG_SLOT_ROTATE=on`）：第 1 片→bot0、第 2 片→bot1……依次循环，
+这样每个频道的承载量与每个 bot 的流控压力都被摊开，整体吞吐接近线性提升。
+
+设 `TG_SLOT_ROTATE=off` 则退回**主备模式**：固定优先用第一个 bot，只有它失败/429 时才切到下一个。
+适合有主备倾向（比如只有主频道做了备份）的场景。
+
+> 注意：轮转只决定**起始槽位**，原有的失败/429 换槽重试逻辑不受影响——两者叠加，
+> 不会因为轮转到某个恰好限流的 bot 就失败。
 - 镜像构建与推送由仓库的 GitHub Actions 工作流（`.github/workflows/docker.yml`）自动完成：推送 `main` 或 `v*` 标签即触发，登录凭据来自仓库 Secrets `DOCKERHUB_USERNAME` / `DOCKERHUB_TOKEN`。
 
 ### 自行构建

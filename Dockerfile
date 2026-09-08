@@ -4,8 +4,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# 仅拷贝源码（扁平布局，同级 import）
-COPY config.py db.py tg.py webdav.py server.py run.py fake_telegram.py selftest.py /app/
+# 仅拷贝源码（扁平布局，同级 import）。
+# 用通配符而非写死清单：新增模块时不必再改这里——否则镜像里会缺文件，
+# 启动时直接 ModuleNotFoundError（media.py 曾踩过这个坑）。
+COPY *.py /app/
 
 # 若有需求可放 README（可选）
 COPY README.md /app/README.md

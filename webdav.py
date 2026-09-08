@@ -1058,7 +1058,7 @@ class App:
         self.backend = (
             _tg.TelegramBackend(
                 self.config.slots, self.config.api_base, self.config.rate_limit,
-                self.config.proxy_token,
+                self.config.proxy_token, self.config.slot_rotate,
             )
             if self.config.slots
             else None

@@ -83,6 +83,12 @@ class Config:
         self.webhook_secret = os.environ.get("TG_WEBHOOK_SECRET")
         self.import_dir = (os.environ.get("WEBDAV_IMPORT_DIR", "/telegram-import") or "/telegram-import").rstrip("/") or "/telegram-import"
         self.rate_limit = float(os.environ.get("TG_RATE_LIMIT", "1.0"))
+        # 多 bot 池的分片分配策略：on=轮转分摊（默认，各频道均匀承载）；
+        # off=固定优先用第一个槽位（主备模式，只有失败/429 才切换）。
+        self.slot_rotate = (
+            os.environ.get("TG_SLOT_ROTATE", "on").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
         self.root_path = (os.environ.get("DAV_ROOT", "/") or "/").rstrip("/") or "/"
         # keep-alive：默认开启（好客户端复用连接）；若某客户端仍报
         # `malformed HTTP status code "HTML>"`，设 off 退回「每条连接只服务一次」。
@@ -109,6 +115,7 @@ class Config:
             "auth": "on" if self.auth_enabled else "off",
             "import_dir": self.import_dir,
             "rate_limit_s": self.rate_limit,
+            "slot_rotate": "on" if self.slot_rotate else "off",
             "keepalive": "on" if self.keepalive else "off",
             "body_timeout_s": self.body_timeout,
             "idle_timeout_s": self.idle_timeout,

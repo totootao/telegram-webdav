@@ -371,6 +371,36 @@ st, h, b = req("PROPFIND", "/media/d.mp3",
 check("media.propfind.has_duration", st == 207 and b"<T:duration>" in b,
       f"status={st} has_duration={b'<T:duration>' in b}")
 
+# 15e) 多 bot 池轮转：分片应均匀落到各个 slot（而不是全堆在 slot 0）
+#      直接驱动 backend，避免依赖真实 Telegram。
+import tg as _tgmod
+_slots = [{"token": f"T{i}", "chat_id": f"-100{i}"} for i in range(5)]
+_be = _tgmod.TelegramBackend(_slots, "http://127.0.0.1:1", rate_limit=0, rotate=True)
+_picks = []
+# 用探针替换 _send_document，记录实际选中的槽位
+_real_send = _be._send_document
+def _probe_send(slot, data, file_name="part.bin", retries=3):
+    _picks.append(_slots.index(slot))
+    return "FAKE-FID", 1
+_be._send_document = _probe_send
+for _i in range(20):
+    _be.upload_chunk(b"x" * 16, file_name=f"p{_i}.bin")
+_be._send_document = _real_send
+check("slot.rotate.uses_all", len(set(_picks)) == 5, f"slots={sorted(set(_picks))}")
+check("slot.rotate.even(4 each)", all(_picks.count(i) == 4 for i in range(5)),
+      f"counts={[_picks.count(i) for i in range(5)]}")
+
+# 关闭轮转（主备模式）应固定用 slot 0
+_be2 = _tgmod.TelegramBackend(_slots, "http://127.0.0.1:1", rate_limit=0, rotate=False)
+_picks2 = []
+def _probe_send2(slot, data, file_name="part.bin", retries=3):
+    _picks2.append(_slots.index(slot))
+    return "FAKE-FID", 1
+_be2._send_document = _probe_send2
+for _i in range(6):
+    _be2.upload_chunk(b"x" * 16, file_name=f"q{_i}.bin")
+check("slot.norotate.pinned_to_0", set(_picks2) == {0}, f"slots={sorted(set(_picks2))}")
+
 # ----------------------------------------------------------------------------
 # 16~20) 健壮性：尾斜杠双向 / 目录重定向 / keep-alive / 缺陷客户端残包 / DAV_ROOT
 # ----------------------------------------------------------------------------
