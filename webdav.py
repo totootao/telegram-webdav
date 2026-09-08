@@ -32,6 +32,7 @@ import json
 import re
 import select
 import socket
+import threading
 import time
 import urllib.parse
 import xml.sax.saxutils
@@ -201,6 +202,12 @@ def _guess_ct(name, fallback="application/octet-stream"):
         "xls": "application/vnd.ms-excel", "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         "ppt": "application/vnd.ms-powerpoint", "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     }.get(ext, fallback)
+
+
+# ---- file_path 预热状态（模块级，跨请求共享）----
+_WARM_LOCK = threading.Lock()
+_WARM_ACTIVE = 0
+_WARM_MAX_ACTIVE = 2
 
 
 class WebDAVHandler(BaseHTTPRequestHandler):
@@ -658,6 +665,9 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             {"Content-Type": 'application/xml; charset="utf-8"'},
             xml.encode("utf-8"),
         )
+        # 响应先发给客户端，再后台预热：列目录到用户点开文件通常有几秒，
+        # 足够把 getFile 的 ~1s RTT 提前消化掉，且不拖慢列目录本身。
+        self._warmup_dir(children)
 
     def _build_propfind(self, base, self_node, children):
         items = [self_node] + children
@@ -785,6 +795,63 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             raise _IntegrityError(cstart)
         return sent, nblk, t_first
 
+    # ---- file_path 预热（不落库版提速）----
+    # Telegram 的 file_path 有效期只有 1 小时，落库会拿到过期路径，所以只在内存里预热：
+    # 客户端列目录(PROPFIND) / 探测(HEAD) 时就把 file_path 取回放进 50min TTL 缓存，
+    # 等真正 GET 时缓存已热，getFile 的 ~1s RTT 从关键路径上消失（实测 TTFB 1.15s→0.18s）。
+    # 预热全部走后台 daemon 线程 + 独立连接，不阻塞响应、不争用下载的连接池。
+    # 预热并发上限：避免大目录反复列目录时堆积过多预热线程打到代理。
+    def _warmup_paths(self, items, tag):
+        """后台预热一批分片的 file_path。已在缓存中的会被跳过（零开销）。
+
+        items: [(file_id, slot), ...]；tag 仅用于日志区分来源（PROPFIND / HEAD）。
+        """
+        if not items:
+            return
+        global _WARM_ACTIVE
+        with _WARM_LOCK:
+            if _WARM_ACTIVE >= _WARM_MAX_ACTIVE:
+                _log(f"file_path 预热跳过: 来源={tag} 已有 {_WARM_ACTIVE} 个预热在执行")
+                return
+            _WARM_ACTIVE += 1
+
+        def _run():
+            try:
+                self.app.backend.prefetch_paths(items)
+            except Exception as e:
+                _log(f"file_path 预热异常(忽略): 来源={tag} err={type(e).__name__}: {e}")
+            finally:
+                with _WARM_LOCK:
+                    _WARM_ACTIVE -= 1
+
+        threading.Thread(target=_run, name=f"warmup-{tag}", daemon=True).start()
+
+    def _warmup_dir(self, nodes):
+        """列目录后预热目录内文件的首片 file_path。
+
+        只取首片：起播/打开文件的第一个字节就是它，是关键路径；
+        其余分片在 GET 时由 prefetch_paths 并发预取（已在 _serve_file 中实现）。
+        """
+        if not getattr(self.app.config, "warmup_propfind", True):
+            return
+        items = []
+        for n in nodes:
+            if n.get("is_dir") or not n.get("chunks"):
+                continue
+            try:
+                cs = json.loads(n["chunks"])
+            except (ValueError, TypeError):
+                continue
+            if not cs:
+                continue
+            items.append((cs[0]["file_id"], cs[0].get("slot", 0)))
+            if len(items) >= self.app.config.warmup_max_files:
+                break
+        if items:
+            _log(f"file_path 预热触发: 来源=PROPFIND 文件数={len(items)} "
+                 f"(仅首片,已缓存的自动跳过)")
+            self._warmup_paths(items, "propfind")
+
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
         if path is None:
@@ -844,6 +911,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         headers["Content-Length"] = str(end - start + 1)
 
         if head_only:
+            # 播放器/下载器通常「HEAD 探测 → 紧跟 GET」：趁探测把全部分片的
+            # file_path 预热好，随后的 GET 直接命中缓存，省掉每片 ~1s 的 getFile。
+            if getattr(self.app.config, "warmup_head", True) and chunks:
+                self._warmup_paths(
+                    [(c["file_id"], c.get("slot", 0)) for c in chunks], "head"
+                )
             self._send(status, headers)
             return
 

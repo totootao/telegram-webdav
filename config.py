@@ -193,6 +193,22 @@ class Config:
         # 越小 → 数据到达越平滑、起播/seek 的首字节越快；越大 → 系统调用越少但首字节等待越久。
         # 播放场景推荐 128~256；纯大文件下载可调到 1024 降低开销。
         self.stream_block_kb = max(16, int(os.environ.get("TG_STREAM_BLOCK_KB", "256") or 256))
+        # ---- file_path 预热（消除首片 getFile 的 ~1s RTT，不落库）----
+        # Telegram 的 file_path 只有 1 小时有效期，因此**不做持久化落库**（落库会拿到过期路径）；
+        # 改为在「客户端列目录 / 探测文件」时后台预取进内存缓存（TTL 50min），
+        # 等用户真正点开下载时缓存已热，getFile 的 RTT 从关键路径上消失。
+        #   TG_WARMUP_PROPFIND  列目录(PROPFIND)时后台预取目录内文件的 file_path（默认 on）
+        #   TG_WARMUP_HEAD      HEAD 探测时预取该文件的全部分片（默认 on，播放器探测后紧跟 GET）
+        #   TG_WARMUP_MAX_FILES 单次列目录最多预热多少个文件（默认 20，防止大目录打爆代理）
+        self.warmup_propfind = (
+            os.environ.get("TG_WARMUP_PROPFIND", "on").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self.warmup_head = (
+            os.environ.get("TG_WARMUP_HEAD", "on").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        self.warmup_max_files = max(1, int(os.environ.get("TG_WARMUP_MAX_FILES", "20") or 20))
         # 并发度：
         #   TG_UPLOAD_CONCURRENCY   上传分片并发线程数（0=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限）
         #   TG_DOWNLOAD_CONCURRENCY （保留兼容旧配置，但**单文件下载已固定改为单线程串行**——
@@ -241,6 +257,9 @@ class Config:
             "keepalive": "on" if self.keepalive else "off",
             "body_timeout_s": self.body_timeout,
             "idle_timeout_s": self.idle_timeout,
+            "warmup_propfind": "on" if self.warmup_propfind else "off",
+            "warmup_head": "on" if self.warmup_head else "off",
+            "warmup_max_files": self.warmup_max_files,
             "stream_all_chunks": "on" if self.stream_all_chunks else "off",
             "stream_block_kb": self.stream_block_kb,
         }
