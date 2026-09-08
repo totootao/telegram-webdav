@@ -56,6 +56,17 @@ _BODY_TIMEOUT = 300.0
 # 直接关连接，不做无谓挣扎。
 _RESIDUAL_LIMIT = 4096
 
+
+class _IntegrityError(Exception):
+    """下载分片时检测到内容完整性被破坏（哈希不符或被截断）。
+
+    抛出后由 ``_serve_file`` 捕获：立刻中断连接，绝不把错数据当完整文件交给客户端。
+    """
+
+    def __init__(self, offset):
+        super().__init__("integrity check failed")
+        self.offset = offset
+
 # 常见 HTTP/WebDAV 方法。用于判断缓冲区开头是「一条新请求」（流水线，不能动）
 # 还是「上一条请求多出来的垃圾字节」（可以安全丢掉）。
 _HTTP_METHODS = frozenset(
@@ -652,6 +663,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 cstart = offset
                 cend = offset + csize - 1
                 offset += csize
+                # 只有「完整落在请求区间内」的分片才能校验整片哈希；
+                # Range 把分片切开的情形只流式转发、不校验（无完整分片可比对）。
+                csha = c.get("sha256")
+                verify = csha is not None and cstart >= start and cend <= end
+                hctx = hashlib.sha256() if verify else None
+                got = 0
                 if cend < start or cstart > end:
                     continue
                 rs = max(cstart, start) - cstart
@@ -666,6 +683,21 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     except (ConnectionError, OSError):
                         # 客户端中途断开，静默结束
                         return
+                    if hctx is not None:
+                        hctx.update(block)
+                        got += len(block)
+                if hctx is not None and got != csize:
+                    # 流式截断/长度对不上：即便哈希没算完也视为损坏
+                    raise _IntegrityError(cstart)
+                if hctx is not None and hctx.hexdigest() != csha:
+                    raise _IntegrityError(cstart)
+        except _IntegrityError as e:
+            # 分片内容与上传时记录的不一致（Telegram 返回了损坏/截断的字节，或数据被污染）：
+            # 已经可能发了一部分脏数据，立刻中断连接，绝不把错数据当完整文件交给客户端。
+            print(f"[webdav] 分片完整性校验失败 {path} @offset {e.offset}: "
+                  f"内容不符或被截断", flush=True)
+            self.close_connection = True
+            return
         except _tg.TGError as e:
             print(f"[webdav] 下载分片失败 {path}: {e}", flush=True)
             self.close_connection = True
@@ -715,6 +747,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         multi = total > chunk_size
         chunks_meta = []
         ci = 0
+        file_hash = hashlib.sha256()  # 整文件 SHA-256：边读边算，零额外内存
         try:
             remaining = total
             while remaining > 0:
@@ -727,12 +760,16 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     buf += part
                 if len(buf) != want:
                     raise _tg.TGError("请求体长度不足（客户端提前断开）")
+                file_hash.update(buf)
+                # 每分片也单独算 SHA-256，供下载时逐片流式校验（姿势 A：边发边验、零缓冲）
+                chunk_sha = hashlib.sha256(buf).hexdigest()
                 chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
                 fid, slot, mid = self.app.backend.upload_chunk(
                     buf, file_name=chunk_name
                 )
                 chunks_meta.append(
-                    {"file_id": fid, "slot": slot, "size": len(buf), "message_id": mid}
+                    {"file_id": fid, "slot": slot, "size": len(buf),
+                     "message_id": mid, "sha256": chunk_sha}
                 )
                 remaining -= len(buf)
                 ci += 1
@@ -746,6 +783,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         self.app.db.create_file(
             path, ct, chunks_meta if total > 0 else [], total,
             chunk_size=chunk_size if total > 0 else None,
+            file_hash=file_hash.hexdigest() if total > 0 else None,
         )
         self._send(204 if existed else 201, {"Content-Type": "text/plain"})
 

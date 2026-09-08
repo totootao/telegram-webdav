@@ -207,6 +207,39 @@ if wn:
 st, h, b = req("PROPFIND", "/test", body=b'<D:propfind xmlns:D="DAV:"><D:prop><D:getcontentlength/></D:prop></D:propfind>', headers={"Depth": "1"})
 check("propfind.depth1(207)", st == 207, f"status={st}")
 
+# 15b) 完整性：PUT 时计算整文件 SHA-256 与每分片 SHA-256 并入库。
+#      用 /test/copied.bin（small.bin 的副本，未被删除），顺带验证 COPY 会把哈希一并带走。
+_fn = dbs.MetaStore(DB_PATH).get_node("/test/copied.bin")
+_fexp = hashlib.sha256(small).hexdigest()
+check("integrity.file_hash_stored", _fn is not None and _fn.get("file_hash") == _fexp,
+      f"got={_fn.get('file_hash') if _fn else None} exp={_fexp}")
+_fch = json.loads(_fn["chunks"])[0] if _fn and _fn.get("chunks") else {}
+check("integrity.chunk_hash_stored", _fch.get("sha256") == _fexp,
+      f"chunk_sha={_fch.get('sha256')}")
+
+# 15c) 完整性：损坏某分片后 GET 应被服务端在分片边界处中断连接（而非把错数据当完整文件）。
+#      用已存在、≥2 分片的 /test/moved.bin（45MB）做脏数据注入（翻转 chunk0 全部字节）。
+_mn = dbs.MetaStore(DB_PATH).get_node("/test/moved.bin")
+_mc = json.loads(_mn["chunks"]) if _mn and _mn.get("chunks") else []
+_c0 = _mc[0]["file_id"]
+_orig = ftg.STORE.get(_c0)
+if _orig:
+    # 只翻转第 1 个字节：SHA-256 会完全不同，但不用做 20MB 的逐字节循环
+    ftg.STORE[_c0] = bytes([_orig[0] ^ 0xFF]) + _orig[1:]
+_truncated = False
+try:
+    st, h, b = req("GET", "/test/moved.bin")
+    # 若没抛异常：声明总字节未收满才算"被检测到"
+    _truncated = (len(b) < _mn["size"])
+except Exception:
+    # urlopen 在 Content-Length 未收满时抛 IncompleteRead -> 连接被提前中断
+    _truncated = True
+finally:
+    if _orig is not None:
+        ftg.STORE[_c0] = _orig  # 还原，避免影响后续用例
+check("integrity.corrupt_chunk_detected", _truncated,
+      f"size={_mn['size'] if _mn else None} truncated={_truncated}")
+
 # ----------------------------------------------------------------------------
 # 16~20) 健壮性：尾斜杠双向 / 目录重定向 / keep-alive / 缺陷客户端残包 / DAV_ROOT
 # ----------------------------------------------------------------------------
