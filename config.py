@@ -177,13 +177,17 @@ class Config:
         self.body_timeout = float(os.environ.get("DAV_BODY_TIMEOUT", "300"))
         # keep-alive 空闲等待上限（秒）：超过则关闭空闲连接回收线程。
         self.idle_timeout = float(os.environ.get("DAV_IDLE_TIMEOUT", "30"))
-        # 并发度（0=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限）：
-        #   TG_UPLOAD_CONCURRENCY   上传分片并发线程数
-        #   TG_DOWNLOAD_CONCURRENCY 下载分片并发线程数（额外硬性上限 _MAX_DOWNLOAD_WORKERS 防内存爆）
+        # 并发度：
+        #   TG_UPLOAD_CONCURRENCY   上传分片并发线程数（0=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限）
+        #   TG_DOWNLOAD_CONCURRENCY （保留兼容旧配置，但**单文件下载已固定改为单线程串行**——
+        #                            详见 webdav._serve_file 注释：原并发版会触发 keep-alive 池互锁、
+        #                            单 bot 流控、按字节序 result() 阻塞，导致「分片间卡顿」。
+        #                            多客户端/多文件并发仍在 ThreadingHTTPServer 层面自然并行。）
         self.upload_concurrency = int(os.environ.get("TG_UPLOAD_CONCURRENCY") or 0) or 0
         self.download_concurrency = int(os.environ.get("TG_DOWNLOAD_CONCURRENCY") or 0) or 0
 
-    # 下载并发的硬性安全上限：避免分片过大 × 并发过多把内存吃光
+    # 下载并发的硬性安全上限：避免分片过大 × 并发过多把内存吃光。
+    # 注意：单文件下载已改为单线程串行，本上限仅作为旧代码/外部工具的兼容值。
     _MAX_DOWNLOAD_WORKERS = 8
 
     def _upload_workers(self, n_slots):
@@ -192,6 +196,7 @@ class Config:
         return max(1, n_slots)
 
     def _download_workers(self, n_chunks):
+        """保留以兼容旧调用与日志；当前 webdav 层不再使用（已固定单线程串行下载）。"""
         auto = max(1, min(n_chunks, len(self.slots), self._MAX_DOWNLOAD_WORKERS))
         if self.download_concurrency > 0:
             return max(1, min(self.download_concurrency, n_chunks, self._MAX_DOWNLOAD_WORKERS))

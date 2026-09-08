@@ -865,13 +865,19 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if not plan:
             return
 
-        workers = self.app.config._download_workers(len(plan))
-        _log(f"GET 并发下载启动: path={path} 需拉分片={len(plan)} 并发线程={workers} "
-             f"Range={self.headers.get('Range')}")
-
-        # 提速要点：首片在主线程「边下边发」(流式转发)，让客户端尽快拿到首字节(降低 TTFB)；
-        # 其余分片交给线程池并发拉取，主线程按字节序依次回写。这样首字节不再等整片 20MB
-        # 缓冲完才发出，且分片间真正并行，下载吞吐接近线性提升、内存峰值大幅下降。
+        # 提速要点（已迭代）：首片在主线程「边下边发」(流式转发)，让客户端尽快拿到首字节(降低 TTFB)；
+        # 其余分片交给主线程串行下载（不再用线程池并发拉取）。
+        #
+        # 历史版本曾用 ThreadPoolExecutor 并发拉取 rest 分片，但实测暴露三个连锁问题，导致
+        # 「下一个分片下载完，下载下一个分片卡顿」：
+        #   1) 按字节序 result() 阻塞：第 i 片 future.result() 未返回前，主线程无法轮到第 i+1 片
+        #      result()，客户端看到的就是「分片间停顿」，即使 i+1 片早就下完躺在 future 里；
+        #   2) keep-alive 连接池互锁：tg._conn_pool 里的 HTTPSConnection 在多线程同时调用
+        #      iter_chunk 时被 http.client 内部序列化（甚至丢包），每个分片都需要额外的等待；
+        #   3) Telegram 1 msg/s 流控：每 bot 并发打多个分片 → 频繁 429 → _send_document 切槽位
+        #      重新 getFile/握手；自建代理侧也会撞并发上限（Cloudflare Worker 等）触发 504。
+        # 改为主线程串行后：没有线程竞争、没有按序 result()、不触发单 bot 流控、连接池不互锁，
+        # TTFB 与并发峰值都更稳。换文件/换客户端的并发仍在 ThreadingHTTPServer 层面自然并行。
         first = plan[0]
         rest = plan[1:]
 
@@ -881,41 +887,28 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             ))
             return ci, data
 
-        rest_futs = {}
+        # 单文件固定单线程下载（参数 `workers` 暂留以兼容日志，但实际不再开线程池）
+        workers = 1
+        _log(f"GET 单线程下载: path={path} 需拉分片={len(plan)} "
+             f"Range={self.headers.get('Range')} "
+             f"(原并发版会触发 keep-alive 池互锁/单bot限流/分片间result阻塞，已改为串行)")
+
         sent = 0
         try:
             if rest:
-                # 显式线程池：结束时用 shutdown(wait=False)，客户端断开时不再干等其余分片下载
-                ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
-                try:
-                    for ci, c, _, _, rs, re_, _ in rest:
-                        rest_futs[ci] = ex.submit(_collect, ci, c, rs, re_)
-                    # 首片先流式写出（边下边发，立刻有首字节）
+                # 首片流式转发（边下边发，立刻有首字节）
+                sent = self._stream_chunk(first)
+                # 剩余分片：主线程串行下载 → 校验 → 回写，零线程竞争 / 零 result() 串行阻塞
+                for ci, c, cstart, cend, rs, re_, verify in rest:
+                    _, data = _collect(ci, c, rs, re_)
+                    if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
+                        raise _IntegrityError(cstart)
                     try:
-                        sent = self._stream_chunk(first)
-                    except (_tg.TGError, _ClientGone):
-                        for f in rest_futs.values():
-                            f.cancel()
-                        raise
-                    # 其余分片按字节序等待 → 校验 → 回写
-                    for ci, c, cstart, cend, rs, re_, verify in rest:
-                        try:
-                            _, data = rest_futs[ci].result()
-                        except _tg.TGError as e:
-                            for f in rest_futs.values():
-                                f.cancel()
-                            raise
-                        if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
-                            raise _IntegrityError(cstart)
-                        try:
-                            self.wfile.write(data)
-                            sent += len(data)
-                        except (ConnectionError, OSError):
-                            for f in rest_futs.values():
-                                f.cancel()
-                            raise _ClientGone(sent)
-                finally:
-                    ex.shutdown(wait=False)
+                        self.wfile.write(data)
+                        sent += len(data)
+                    except (ConnectionError, OSError):
+                        # 客户端中途断开：立刻停止（不需要 cancel 线程池了）
+                        raise _ClientGone(sent)
             else:
                 # 单分片：直接流式转发
                 sent = self._stream_chunk(first)
@@ -938,7 +931,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         _log(f"GET 完成: path={path} 状态={status} 区间={start}-{end}/{total} "
              f"已发={_fmt_size(sent)}({sent}B) 耗时={time.time() - t0:.2f}s "
-             f"吞吐={_fmt_speed(sent, time.time() - t0)} 并发={workers} "
+             f"吞吐={_fmt_speed(sent, time.time() - t0)} 模式=单线程串行 "
              f"类型={_media_kind(content_type, path.rsplit('/', 1)[-1])} "
              f"时长={_fmt_dur(dur)}")
 

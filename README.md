@@ -196,7 +196,7 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_RATE_LIMIT` | 每 bot 发送最小间隔（秒），防 429 | `1.0` |
 | `TG_SLOT_ROTATE` | 多 bot 池分片是否轮转分摊（`on`=各频道均匀承载；`off`=固定优先第一个，即主备模式） | `on` |
 | `TG_UPLOAD_CONCURRENCY` | 上传分片并发线程数（`0`=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限） | `0`（=bot 数） |
-| `TG_DOWNLOAD_CONCURRENCY` | 下载分片并发线程数（`0`=自动，取 `min(分片数, bot 数)`，硬性上限 8 防内存爆） | `0`（=min(分片数,bot数,8)） |
+| `TG_DOWNLOAD_CONCURRENCY` | 下载并发（保留兼容旧配置，**单文件下载已固定为单线程串行**，详见 webdav.py `_serve_file` 注释；多客户端/多文件并发仍在 `ThreadingHTTPServer` 层面自然并行） | `0` |
 | `DAV_ROOT` | 把 WebDAV 根挂载到某子路径（默认 `/`），如 `/dav`；href 会自动带此前缀 | `/` |
 | `DAV_KEEPALIVE` | 是否复用 TCP 连接（`on`/`off`）；个别客户端请求体长度数错导致错位时设 `off` | `on` |
 | `DAV_BODY_TIMEOUT` | 请求体读取超时（秒），防止 `Content-Length` 虚高把线程拖死 | `300` |
