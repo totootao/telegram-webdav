@@ -17,9 +17,12 @@
 TG_API_BASE：可指向自建代理（国内/被墙场景），所有请求加该前缀。
 """
 import base64
+import collections
 import datetime
+import http.client
 import json
 import re
+import socket
 import threading
 import time
 import urllib.error
@@ -113,6 +116,10 @@ class TelegramBackend:
         self._last = {}  # slot idx -> 上次发送时间
         self._path_cache = {}  # file_id -> (file_path, expire_ts)
         self._path_cache_ttl = 50 * 60  # TG file_path 有效期 1h，缓存 50min
+        # 连接池：按 (scheme,host,port) 复用 keep-alive 连接，避免视频播放时每个
+        # Range 请求都重做 TLS 握手（播放器会高频发 Range，复用连接大幅降低首字节延迟）。
+        self._conn_pool = {}  # key -> collections.deque([conn, ...])
+        self._conn_lock = threading.Lock()
         self._slot_lock = threading.Lock()
         self._slot_cursor = 0
         self._proxy_lock = threading.Lock()
@@ -201,6 +208,71 @@ class TelegramBackend:
         if tk:
             req.add_header("Authorization", f"Bearer {tk}")
         return req
+
+    # ---------- 连接池（keep-alive 复用，针对视频高频 Range 优化） ----------
+    def _conn_key(self, api_base):
+        p = urllib.parse.urlparse(api_base or self.api_base)
+        scheme = (p.scheme or "https").lower()
+        port = p.port or (443 if scheme == "https" else 80)
+        return (scheme, p.hostname, port)
+
+    def _open_conn(self, api_base):
+        p = urllib.parse.urlparse(api_base or self.api_base)
+        scheme = (p.scheme or "https").lower()
+        host = p.hostname
+        port = p.port or (443 if scheme == "https" else 80)
+        if scheme == "https":
+            return http.client.HTTPSConnection(host, port, timeout=180)
+        return http.client.HTTPConnection(host, port, timeout=180)
+
+    def _acquire_conn(self, api_base):
+        key = self._conn_key(api_base)
+        with self._conn_lock:
+            dq = self._conn_pool.get(key)
+            if dq:
+                return dq.popleft()
+        return None
+
+    def _release_conn(self, api_base, conn, alive):
+        if conn is None:
+            return
+        if not alive:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return
+        key = self._conn_key(api_base)
+        with self._conn_lock:
+            self._conn_pool.setdefault(key, collections.deque()).append(conn)
+
+    def _do_get(self, api_base, path, proxy_token=None, rng=None, timeout=180):
+        """发一次 GET（getFile / 文件字节通用），返回 (conn, resp)。
+
+        连接优先从连接池取（keep-alive 复用）；建连或发送失败自动换一条新连接重试一次。
+        调用方读完整响应体后须用 _release_conn 归还（alive=not resp.will_close）。
+        """
+        last = None
+        for _ in range(2):
+            conn = self._acquire_conn(api_base)
+            if conn is None:
+                conn = self._open_conn(api_base)
+            headers = {"User-Agent": "TelegramWebDAV/1.0 (+python-urllib)"}
+            if proxy_token:
+                headers["Authorization"] = f"Bearer {proxy_token}"
+            if rng:
+                headers["Range"] = rng
+            try:
+                conn.request("GET", path, headers=headers)
+                resp = conn.getresponse()
+                return conn, resp
+            except (http.client.HTTPException, OSError, socket.timeout) as e:
+                last = e
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        raise last or TGError("连接失败")
 
     # ---------- 限流 ----------
     def _rate_wait(self, idx):
@@ -382,14 +454,25 @@ class TelegramBackend:
             _log(f"getFile 命中缓存: file_id={file_id} path={cached[0]}")
             return cached[0]
         base = (api_base or self.api_base).rstrip("/")
-        url = self._api_url(token, "getFile", base) + "?file_id=" + urllib.parse.quote(file_id)
+        bp = urllib.parse.urlparse(base).path or ""
+        path = f"{bp}/bot{token}/getFile?file_id=" + urllib.parse.quote(file_id)
         _log(f"getFile 请求: file_id={file_id} api={base} "
              f"proxy_auth={'on' if proxy_token else 'off'}")
         for attempt in range(3):
             try:
-                req = self._prepare(urllib.request.Request(url))
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    raw = resp.read().decode("utf-8", "replace")
+                conn, resp = self._do_get(base, path, proxy_token, timeout=30)
+                alive = not getattr(resp, "will_close", False)
+                if resp.status != 200:
+                    body = resp.read()
+                    self._release_conn(base, conn, False)
+                    _log(f"getFile HTTP 错误: code={resp.status} attempt={attempt + 1}/3 "
+                         f"file_id={file_id} body={body[:200]!r}")
+                    if resp.status == 429:
+                        time.sleep(2)
+                        continue
+                    raise TGError(f"getFile HTTP {resp.status}: {body[:160]}")
+                raw = resp.read().decode("utf-8", "replace")
+                self._release_conn(base, conn, alive)
                 try:
                     js = json.loads(raw)
                 except json.JSONDecodeError as e:
@@ -407,17 +490,7 @@ class TelegramBackend:
                 self._path_cache[file_id] = (fp, now + self._path_cache_ttl)
                 _log(f"getFile 成功: file_id={file_id} path={fp}")
                 return fp
-            except urllib.error.HTTPError as e:
-                text = e.read().decode("utf-8", "replace")
-                _log(f"getFile HTTP 错误: code={e.code} attempt={attempt + 1}/3 "
-                     f"file_id={file_id} body={text[:200]!r}")
-                if e.code == 429:
-                    time.sleep(2)
-                    continue
-                raise TGError(f"getFile HTTP {e.code}: {text[:160]}")
-            except TGError:
-                raise
-            except Exception as e:
+            except (http.client.HTTPException, OSError, socket.timeout) as e:
                 _log(f"getFile 网络/其他错误: {type(e).__name__}: {e} attempt={attempt + 1}/3 "
                      f"file_id={file_id} api={base}")
                 if attempt < 2:
@@ -426,10 +499,11 @@ class TelegramBackend:
                 raise TGError(f"getFile: {e}")
         raise TGError("getFile 失败")
 
-    def iter_chunk(self, file_id, slot, start=None, end=None, blk=256 * 1024):
+    def iter_chunk(self, file_id, slot, start=None, end=None, blk=1024 * 1024):
         """生成器：按 Range 取回单块字节。start/end 为相对该块的字节区间（含端点）。
 
         遍历该 bot 的全部代理候选：某代理网络/5xx 失败自动切换下一个；4xx/429 直接抛出。
+        连接走 keep-alive 连接池（_do_get/_release_conn），视频高频 Range 下省去重复握手。
         """
         n = len(self.slots)
         sd = self.slots[slot % n]
@@ -440,35 +514,48 @@ class TelegramBackend:
         for ci, (api_base, proxy_token) in enumerate(cands):
             try:
                 fp = self._get_file_path(file_id, token, api_base, proxy_token)
-                url = self._file_url(token, fp, api_base)
-                req = self._prepare(urllib.request.Request(url), proxy_token)
+                base = (api_base or self.api_base).rstrip("/")
+                bp = urllib.parse.urlparse(base).path or ""
+                path = f"{bp}/file/bot{token}/{fp}"
                 rng = None
                 if start is not None:
                     rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
-                    req.add_header("Range", rng)
-                _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} url={url} "
+                _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} path={path} "
                      f"proxy_auth={'on' if proxy_token else 'off'}")
+                conn, resp = self._do_get(base, path, proxy_token, rng, timeout=180)
+                alive = not getattr(resp, "will_close", False)
+                if resp.status >= 400:
+                    body = resp.read()
+                    self._release_conn(base, conn, False)
+                    msg = f"iter_chunk HTTP {resp.status}: {body[:160]!r}"
+                    code = str(resp.status)
+                    _log(f"iter_chunk 代理候选 {ci} HTTP {code}: {msg}")
+                    if code == "429":
+                        raise TGError(msg)
+                    if code in _BUSINESS_4XX:
+                        raise TGError(msg)
+                    last = TGError(msg)
+                    _log(f"iter_chunk 代理候选 {ci} 失败({msg})，切换下一代理: api={api_base}")
+                    continue
                 total_yield = 0
-                with urllib.request.urlopen(req, timeout=180) as resp:
+                try:
                     while True:
                         b = resp.read(blk)
                         if not b:
                             break
                         total_yield += len(b)
                         yield b
+                finally:
+                    # 读完整响应体后才归还连接，保证 keep-alive 连接可安全复用
+                    self._release_conn(base, conn, alive)
                 _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield}")
                 return
-            except TGError as e:
+            except TGError:
+                raise
+            except (http.client.HTTPException, OSError, socket.timeout) as e:
                 last = e
-                msg = str(e)
-                code = _http_code_of(msg)
-                if code == "429":
-                    _log(f"iter_chunk 代理候选 {ci} 限流(同 bot)，不再换代理: {msg}")
-                    raise
-                if code in _BUSINESS_4XX:
-                    _log(f"iter_chunk 代理候选 {ci} 业务错误({code})，换代理无意义: {msg}")
-                    raise
-                _log(f"iter_chunk 代理候选 {ci} 失败({msg})，切换下一代理: api={api_base}")
+                _log(f"iter_chunk 代理候选 {ci} 网络/其他错误: {type(e).__name__}: {e} "
+                     f"api={api_base}")
                 continue
             except Exception as e:
                 last = e

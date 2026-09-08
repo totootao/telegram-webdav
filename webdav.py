@@ -670,6 +670,30 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 "message_id": mid, "sha256": chunk_sha, "_buf": buf,
             })
 
+    def _stream_chunk(self, entry):
+        """边下边发单分片：迭代 backend.iter_chunk 产生的字节块，直接写给客户端。
+
+        用于「首字节尽快到达」场景（降低 TTFB）。完整分片(verify=True)会增量计算 SHA-256
+        并在结束后比对；Range 切开的片段(verify=False)只转发不校验。
+        """
+        ci, c, cstart, cend, rs, re_, verify = entry
+        h = hashlib.sha256() if verify else None
+        try:
+            for block in self.app.backend.iter_chunk(
+                c["file_id"], c.get("slot", 0), rs, re_
+            ):
+                if h is not None:
+                    h.update(block)
+                try:
+                    self.wfile.write(block)
+                except (ConnectionError, OSError):
+                    # 客户端中途断开，静默结束
+                    return
+        except _tg.TGError:
+            raise
+        if h is not None and h.hexdigest() != c.get("sha256"):
+            raise _IntegrityError(cstart)
+
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
         if path is None:
@@ -760,33 +784,49 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         _log(f"GET 并发下载启动: path={path} 需拉分片={len(plan)} 并发线程={workers} "
              f"Range={self.headers.get('Range')}")
 
-        # 并发拉取各分片（完整片段），主线程按字节序回写（保序流式，内存只保留窗口内分片）
-        def _fetch(ci, c, rs, re_):
+        # 提速要点：首片在主线程「边下边发」(流式转发)，让客户端尽快拿到首字节(降低 TTFB)；
+        # 其余分片交给线程池并发拉取，主线程按字节序依次回写。这样首字节不再等整片 20MB
+        # 缓冲完才发出，且分片间真正并行，下载吞吐接近线性提升、内存峰值大幅下降。
+        first = plan[0]
+        rest = plan[1:]
+
+        def _collect(ci, c, rs, re_):
             data = b"".join(self.app.backend.iter_chunk(
                 c["file_id"], c.get("slot", 0), rs, re_
             ))
             return ci, data
 
-        fut_by_ci = {}
+        rest_futs = {}
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                for ci, c, _, _, rs, re_, _ in plan:
-                    fut_by_ci[ci] = ex.submit(_fetch, ci, c, rs, re_)
-                # 按字节序逐片等待 → 校验 → 回写（前面的分片已写出即可释放内存）
-                for ci, c, cstart, cend, rs, re_, verify in plan:
+            if rest:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+                    for ci, c, _, _, rs, re_, _ in rest:
+                        rest_futs[ci] = ex.submit(_collect, ci, c, rs, re_)
+                    # 首片先流式写出（边下边发，立刻有首字节）
                     try:
-                        _, data = fut_by_ci[ci].result()
-                    except _tg.TGError as e:
-                        for f in fut_by_ci.values():
+                        self._stream_chunk(first)
+                    except _tg.TGError:
+                        for f in rest_futs.values():
                             f.cancel()
                         raise
-                    if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
-                        raise _IntegrityError(cstart)
-                    try:
-                        self.wfile.write(data)
-                    except (ConnectionError, OSError):
-                        # 客户端中途断开，静默结束
-                        return
+                    # 其余分片按字节序等待 → 校验 → 回写
+                    for ci, c, cstart, cend, rs, re_, verify in rest:
+                        try:
+                            _, data = rest_futs[ci].result()
+                        except _tg.TGError as e:
+                            for f in rest_futs.values():
+                                f.cancel()
+                            raise
+                        if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
+                            raise _IntegrityError(cstart)
+                        try:
+                            self.wfile.write(data)
+                        except (ConnectionError, OSError):
+                            # 客户端中途断开，静默结束
+                            return
+            else:
+                # 单分片：直接流式转发
+                self._stream_chunk(first)
         except _IntegrityError as e:
             # 分片内容与上传时记录的不一致（Telegram 返回了损坏/截断的字节，或数据被污染）：
             # 已经可能发了一部分脏数据，立刻中断连接，绝不把错数据当完整文件交给客户端。
