@@ -75,6 +75,8 @@ class MetaStore:
             cols = {r[1] for r in self._conn.execute("PRAGMA table_info(nodes)").fetchall()}
             if "file_hash" not in cols:
                 self._conn.execute("ALTER TABLE nodes ADD COLUMN file_hash TEXT")
+            if "duration" not in cols:
+                self._conn.execute("ALTER TABLE nodes ADD COLUMN duration REAL")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS locks (
@@ -141,20 +143,23 @@ class MetaStore:
             return [dict(r) for r in rows]
 
     # ---------- 创建 ----------
-    def create_file(self, path, content_type, chunks, size, chunk_size=None, mtime=None, file_hash=None):
+    def create_file(self, path, content_type, chunks, size, chunk_size=None, mtime=None,
+                    file_hash=None, duration=None):
         now = int(time.time())
         name = path.rstrip("/").split("/")[-1]
         etag = '"' + uuid.uuid4().hex + '"'
         chunks_json = json.dumps(chunks, ensure_ascii=False) if chunks is not None else None
         with self._lock:
             self._conn.execute(
-                "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,chunk_size,chunks,file_hash) "
-                "VALUES(?,?,0,?,?,?,?,?,?,?,?) "
+                "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,"
+                "chunk_size,chunks,file_hash,duration) "
+                "VALUES(?,?,0,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(path) DO UPDATE SET name=excluded.name, size=excluded.size, "
                 "content_type=excluded.content_type, etag=excluded.etag, mtime=?, "
-                "chunk_size=excluded.chunk_size, chunks=excluded.chunks, file_hash=excluded.file_hash",
+                "chunk_size=excluded.chunk_size, chunks=excluded.chunks, "
+                "file_hash=excluded.file_hash, duration=excluded.duration",
                 (path, name, size, content_type, etag, mtime or now, now,
-                 chunk_size, chunks_json, file_hash, mtime or now),
+                 chunk_size, chunks_json, file_hash, duration, mtime or now),
             )
             self._conn.commit()
         return etag
@@ -204,13 +209,16 @@ class MetaStore:
                 old = n["path"]
                 new = dst if old == src else dst + old[len(src):]
                 self._conn.execute(
-                    "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,chunk_size,chunks,file_hash) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                    "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,"
+                    "chunk_size,chunks,file_hash,duration) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET name=excluded.name, is_dir=excluded.is_dir, "
                     "size=excluded.size, content_type=excluded.content_type, etag=excluded.etag, "
-                    "mtime=?, chunk_size=excluded.chunk_size, chunks=excluded.chunks, file_hash=excluded.file_hash",
+                    "mtime=?, chunk_size=excluded.chunk_size, chunks=excluded.chunks, "
+                    "file_hash=excluded.file_hash, duration=excluded.duration",
                     (new, n["name"], n["is_dir"], n["size"], n["content_type"], n["etag"],
-                     int(time.time()), n["ctime"], n["chunk_size"], n["chunks"], n.get("file_hash"), int(time.time())),
+                     int(time.time()), n["ctime"], n["chunk_size"], n["chunks"],
+                     n.get("file_hash"), n.get("duration"), int(time.time())),
                 )
             sprefix = "/" if src == "/" else src + "/"
             self._conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
@@ -233,13 +241,16 @@ class MetaStore:
                 old = n["path"]
                 new = dst if old == src else dst + old[len(src):]
                 self._conn.execute(
-                    "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,chunk_size,chunks,file_hash) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                    "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,"
+                    "chunk_size,chunks,file_hash,duration) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET name=excluded.name, is_dir=excluded.is_dir, "
                     "size=excluded.size, content_type=excluded.content_type, etag=excluded.etag, "
-                    "mtime=?, chunk_size=excluded.chunk_size, chunks=excluded.chunks, file_hash=excluded.file_hash",
+                    "mtime=?, chunk_size=excluded.chunk_size, chunks=excluded.chunks, "
+                    "file_hash=excluded.file_hash, duration=excluded.duration",
                     (new, n["name"], n["is_dir"], n["size"], n["content_type"], n["etag"],
-                     n["mtime"], n["ctime"], n["chunk_size"], n["chunks"], n.get("file_hash"), n["mtime"]),
+                     n["mtime"], n["ctime"], n["chunk_size"], n["chunks"],
+                     n.get("file_hash"), n.get("duration"), n["mtime"]),
                 )
             self._conn.commit()
         return True

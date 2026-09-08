@@ -38,6 +38,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import config as _config
 import db as _db
+import media as _media
 import tg as _tg
 
 
@@ -55,6 +56,13 @@ _BODY_TIMEOUT = 300.0
 # 单次最多丢掉多少个「Content-Length 之外」的垃圾字节。超过说明客户端严重错乱，
 # 直接关连接，不做无谓挣扎。
 _RESIDUAL_LIMIT = 4096
+
+
+# 媒体时长解析的采样大小（字节）。只取首片的头部与末片的尾部，O(1) 次切片拷贝：
+# 时长信息（moov/mvhd、Xing、fmt、STREAMINFO）都在文件头或文件尾，不需要全文扫描。
+# tail 给得比 head 大，是因为 MP4 未做 faststart 时 moov 落在文件尾且可能较大。
+_MEDIA_HEAD_SAMPLE = 512 * 1024
+_MEDIA_TAIL_SAMPLE = 4 * 1024 * 1024
 
 
 class _IntegrityError(Exception):
@@ -560,7 +568,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
     def _build_propfind(self, base, self_node, children):
         items = [self_node] + children
         out = ['<?xml version="1.0" encoding="utf-8"?>']
-        out.append('<D:multistatus xmlns:D="DAV:">')
+        # xmlns:T 为本项目的自定义元数据命名空间（媒体时长等）。不支持的客户端会忽略它。
+        out.append('<D:multistatus xmlns:D="DAV:" xmlns:T="urn:telegram-webdav:meta">')
         for n in items:
             is_dir = bool(n["is_dir"])
             href = self._href(n["path"], is_dir)
@@ -579,6 +588,10 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             ct = n.get("content_type") or ("" if is_dir else "application/octet-stream")
             out.append(f"      <D:getcontenttype>{ct}</D:getcontenttype>")
             out.append(f"      <D:displayname>{xml.sax.saxutils.escape(n['name'])}</D:displayname>")
+            # 自定义属性：媒体时长（秒，3 位小数）。仅音频/视频有，其余文件不输出该元素。
+            dur = n.get("duration")
+            if dur:
+                out.append(f'      <T:duration>{dur:.3f}</T:duration>')
             out.append("    </D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>")
             out.append("  </D:response>")
         out.append("</D:multistatus>")
@@ -748,6 +761,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         chunks_meta = []
         ci = 0
         file_hash = hashlib.sha256()  # 整文件 SHA-256：边读边算，零额外内存
+        head_sample = b""  # 首片头部采样（解析媒体时长用）
+        tail_sample = b""  # 末片尾部采样
         try:
             remaining = total
             while remaining > 0:
@@ -760,6 +775,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     buf += part
                 if len(buf) != want:
                     raise _tg.TGError("请求体长度不足（客户端提前断开）")
+                if ci == 0:
+                    head_sample = buf[:_MEDIA_HEAD_SAMPLE]
                 file_hash.update(buf)
                 # 每分片也单独算 SHA-256，供下载时逐片流式校验（姿势 A：边发边验、零缓冲）
                 chunk_sha = hashlib.sha256(buf).hexdigest()
@@ -772,6 +789,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                      "message_id": mid, "sha256": chunk_sha}
                 )
                 remaining -= len(buf)
+                if remaining == 0:
+                    tail_sample = buf[-_MEDIA_TAIL_SAMPLE:]
                 ci += 1
             # 清理残留字节（AList 类 CL 少算），必要时关闭连接
             self._drain_residual()
@@ -780,10 +799,22 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                        f"上传到 Telegram 失败: {e}".encode("utf-8"))
             return
 
+        # 媒体时长（音频/视频）：本地解析，Telegram 侧仍是原字节存储，不影响分片与哈希。
+        # 解析失败一律吞掉——绝不能因为元数据解析影响上传结果。
+        duration = None
+        if total > 0:
+            try:
+                duration = _media.probe_duration(
+                    head_sample, tail_sample, total, path.rsplit("/", 1)[-1]
+                )
+            except Exception:
+                duration = None
+
         self.app.db.create_file(
             path, ct, chunks_meta if total > 0 else [], total,
             chunk_size=chunk_size if total > 0 else None,
             file_hash=file_hash.hexdigest() if total > 0 else None,
+            duration=duration,
         )
         self._send(204 if existed else 201, {"Content-Type": "text/plain"})
 

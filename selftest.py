@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import socket
+import struct
 import sys
 import threading
 import time
@@ -239,6 +240,74 @@ finally:
         ftg.STORE[_c0] = _orig  # 还原，避免影响后续用例
 check("integrity.corrupt_chunk_detected", _truncated,
       f"size={_mn['size'] if _mn else None} truncated={_truncated}")
+
+# ----------------------------------------------------------------------------
+# 15d) 媒体时长：本地解析（不让 Telegram 转码破坏字节），存库 + PROPFIND 自定义属性。
+#      下面构造的都是"结构合法的最小文件"，足以验证解析器取到的时长是否正确。
+# ----------------------------------------------------------------------------
+def _mk_wav(data_len=176400, rate=44100, ch=2, bits=16):
+    byte_rate = rate * ch * bits // 8           # 44100*2*2 = 176400 -> 1.0s
+    hdr = b"RIFF" + struct.pack("<I", 36 + data_len) + b"WAVE"
+    fmt = b"fmt " + struct.pack("<IHHIIHH", 16, 1, ch, rate, byte_rate, ch * bits // 8, bits)
+    dat = b"data" + struct.pack("<I", data_len)
+    return hdr + fmt + dat + b"\x00" * data_len
+
+
+def _mk_flac(sr=44100, total=88200, ch=2, bps=16):
+    # STREAMINFO: sample_rate(20) | channels-1(3) | bps-1(5) | total_samples(36)
+    v = (sr << 44) | ((ch - 1) << 41) | ((bps - 1) << 36) | total
+    body = (b"\x10\x00" + b"\x10\x00" + b"\x00\x00\x00" + b"\x00\x00\x00"
+            + v.to_bytes(8, "big") + b"\x00" * 16)
+    return b"fLaC" + bytes([0x00]) + len(body).to_bytes(3, "big") + body  # type 0 = STREAMINFO
+
+
+def _mk_mp4(ts=1000, du=5000):
+    payload = (b"\x00\x00\x00\x00" + b"\x00" * 4 + b"\x00" * 4
+               + ts.to_bytes(4, "big") + du.to_bytes(4, "big") + b"\x00" * 80)
+    mvhd = (108).to_bytes(4, "big") + b"mvhd" + payload
+    moov = (8 + len(mvhd)).to_bytes(4, "big") + b"moov" + mvhd
+    fp = b"isom" + b"\x00\x00\x02\x00" + b"isom"
+    ftyp = (8 + len(fp)).to_bytes(4, "big") + b"ftyp" + fp
+    return ftyp + moov
+
+
+def _mk_mp3(frames=100):
+    # MPEG1 Layer3 / 128kbps / 44100Hz / stereo -> side info 32B，spf 1152
+    hdr = bytes([0xFF, 0xFB, 0x90, 0x00])
+    xing = b"Xing" + (1).to_bytes(4, "big") + frames.to_bytes(4, "big")
+    return hdr + b"\x00" * 32 + xing + b"\x00" * 64
+
+
+req("MKCOL", "/media")
+for _nm, _data in (("a.wav", _mk_wav()), ("b.flac", _mk_flac()),
+                   ("c.mp4", _mk_mp4()), ("d.mp3", _mk_mp3())):
+    st, h, b = req("PUT", "/media/" + _nm, body=_data,
+                   headers={"Content-Type": "application/octet-stream"})
+    check(f"media.put.{_nm}(201)", st == 201, f"status={st}")
+
+
+def _dur(p):
+    _n = dbs.MetaStore(DB_PATH).get_node(p)
+    return _n.get("duration") if _n else None
+
+
+check("media.wav.duration(1.0s)", _dur("/media/a.wav") == 1.0, f"got={_dur('/media/a.wav')}")
+check("media.flac.duration(2.0s)", _dur("/media/b.flac") == 2.0, f"got={_dur('/media/b.flac')}")
+check("media.mp4.duration(5.0s)", _dur("/media/c.mp4") == 5.0, f"got={_dur('/media/c.mp4')}")
+_mp3exp = 100 * 1152 / 44100
+check("media.mp3.duration(xing)",
+      _dur("/media/d.mp3") is not None and abs(_dur("/media/d.mp3") - _mp3exp) < 0.01,
+      f"got={_dur('/media/d.mp3')} exp={_mp3exp}")
+# 非媒体文件不应解析出时长（也不能误判）
+req("PUT", "/media/e.bin", body=b"not a media file" * 256,
+    headers={"Content-Type": "application/octet-stream"})
+check("media.nonmedia.none", _dur("/media/e.bin") is None, f"got={_dur('/media/e.bin')}")
+# PROPFIND 应带自定义命名空间的 duration
+st, h, b = req("PROPFIND", "/media/d.mp3",
+               body=b'<D:propfind xmlns:D="DAV:"><D:prop><D:getcontentlength/></D:prop></D:propfind>',
+               headers={"Depth": "0"})
+check("media.propfind.has_duration", st == 207 and b"<T:duration>" in b,
+      f"status={st} has_duration={b'<T:duration>' in b}")
 
 # ----------------------------------------------------------------------------
 # 16~20) 健壮性：尾斜杠双向 / 目录重定向 / keep-alive / 缺陷客户端残包 / DAV_ROOT

@@ -80,6 +80,42 @@ WebDAV 客户端 ──PROPFIND/GET/PUT──▶ TelegramWebDAV (本服务)
 
 ---
 
+## 媒体时长记录（音频 / 视频）
+
+上传音频/视频时，服务会在**本地**解析出时长存进元数据，并可通过 WebDAV 自定义属性读到。
+
+> **为什么不交给 Telegram**：`sendAudio` / `sendVideo` 确实会解析媒体并回带 `duration`，
+> 但 `sendVideo` 会**转码**视频——下载到的字节 ≠ 上传的字节，直接破坏上面的 SHA-256 校验；
+> 而且文件切成 20MB 分片后，每片都是任意字节片段，根本不是合法媒体文件，无从解析。
+> 所以时长在本地算，Telegram 侧仍是 `application/octet-stream` 原字节，存储链路一行不改。
+
+| 格式 | 取时长的依据 | 精度 |
+|---|---|---|
+| MP4 / M4A / M4B / M4V / MOV / 3GP | `moov` → `mvhd` 的 timescale / duration | 精确 |
+| MP3 | Xing / Info 头的总帧数；无 Xing 时按 CBR 比特率估算 | 精确 / 估算 |
+| WAV | `fmt ` 的字节率 + `data` 块大小 | 精确 |
+| FLAC | STREAMINFO 的 sample rate 与 total samples | 精确 |
+
+**开销**：只在 PUT 时取**首片头部 512KB + 末片尾部 4MB** 做采样，O(采样) 解析，
+不全文扫描；解析失败一律返回 `None`，绝不影响上传结果。相比分片上传的网络 I/O 可忽略。
+
+**读取**：PROPFIND 响应里带自定义命名空间属性（单位秒）：
+
+```xml
+<T:duration>123.456</T:duration>
+```
+
+命名空间为 `urn:telegram-webdav:meta`，不支持该属性的客户端会自动忽略。
+
+**已知局限**：
+
+- 不支持 **MKV/WebM**（EBML）与 **OGG**（需按页解析），这两类返回 `None`
+- MP4 若未做 faststart 且 `moov` 大于 4MB，尾部采样可能覆盖不到 → 返回 `None`
+- VBR MP3 若无 Xing / Info 头，只能按平均比特率估算，存在误差
+- 已入库的旧文件没有时长，重新 PUT 一次即可补上（MKV / OGG 补不上）
+
+---
+
 ## 快速开始
 
 ### 1. 准备 Telegram
