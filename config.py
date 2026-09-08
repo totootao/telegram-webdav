@@ -177,6 +177,22 @@ class Config:
         self.body_timeout = float(os.environ.get("DAV_BODY_TIMEOUT", "300"))
         # keep-alive 空闲等待上限（秒）：超过则关闭空闲连接回收线程。
         self.idle_timeout = float(os.environ.get("DAV_IDLE_TIMEOUT", "30"))
+        # ---- 音视频播放（流式下发）相关 ----
+        # 单文件下载时，是否让「所有分片」都边下边发（而不只是首片）。
+        # 播放场景的关键开关：
+        #   on (默认) = 全分片流式：数据连续流向播放器，分片边界无停顿，播放丝滑；
+        #   off       = 旧行为——首片流式、其余分片整片缓冲到内存再一次性写出，
+        #               20MB 分片下每到一个分片边界就要等整片下载完，播放周期性卡顿。
+        # 流式模式下 SHA-256 仍逐片校验（边发边算，分片末尾比对，不符立即中断连接），
+        # 只是无法「先验后发」——这是流式下发的固有取舍。
+        self.stream_all_chunks = (
+            os.environ.get("TG_STREAM_ALL_CHUNKS", "on").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        # 流式读块大小(KB)：决定「从 Telegram 读到多少字节就写给客户端一次」。
+        # 越小 → 数据到达越平滑、起播/seek 的首字节越快；越大 → 系统调用越少但首字节等待越久。
+        # 播放场景推荐 128~256；纯大文件下载可调到 1024 降低开销。
+        self.stream_block_kb = max(16, int(os.environ.get("TG_STREAM_BLOCK_KB", "256") or 256))
         # 并发度：
         #   TG_UPLOAD_CONCURRENCY   上传分片并发线程数（0=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限）
         #   TG_DOWNLOAD_CONCURRENCY （保留兼容旧配置，但**单文件下载已固定改为单线程串行**——
@@ -225,6 +241,8 @@ class Config:
             "keepalive": "on" if self.keepalive else "off",
             "body_timeout_s": self.body_timeout,
             "idle_timeout_s": self.idle_timeout,
+            "stream_all_chunks": "on" if self.stream_all_chunks else "off",
+            "stream_block_kb": self.stream_block_kb,
         }
 
 

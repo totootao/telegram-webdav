@@ -513,12 +513,17 @@ class TelegramBackend:
                 raise TGError(f"getFile: {e}")
         raise TGError("getFile 失败")
 
-    def iter_chunk(self, file_id, slot, start=None, end=None, blk=1024 * 1024):
+    def iter_chunk(self, file_id, slot, start=None, end=None, blk=None):
         """生成器：按 Range 取回单块字节。start/end 为相对该块的字节区间（含端点）。
+
+        ``blk`` 是每次 ``resp.read()`` 的块大小，直接决定「读到多少字节就 yield 一次」，
+        也就是流式下发时客户端每隔多久收到一批数据：块越小越平滑、首字节越快，
+        块越大系统调用越少。由 webdav 层按 ``TG_STREAM_BLOCK_KB`` 传入（缺省 1MB）。
 
         遍历该 bot 的全部代理候选：某代理网络/5xx 失败自动切换下一个；4xx/429 直接抛出。
         连接走 keep-alive 连接池（_do_get/_release_conn），视频高频 Range 下省去重复握手。
         """
+        blk = int(blk or 1024 * 1024)
         n = len(self.slots)
         sd = self.slots[slot % n]
         token = sd["token"]

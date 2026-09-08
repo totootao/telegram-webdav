@@ -745,25 +745,37 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 "message_id": mid, "sha256": chunk_sha, "_buf": buf,
             })
 
-    def _stream_chunk(self, entry):
+    def _stream_chunk(self, entry, blk=None):
         """边下边发单分片：迭代 backend.iter_chunk 产生的字节块，直接写给客户端。
 
-        用于「首字节尽快到达」场景（降低 TTFB）。完整分片(verify=True)会增量计算 SHA-256
-        并在结束后比对；Range 切开的片段(verify=False)只转发不校验。
+        这是「播放丝滑」的核心：从 Telegram 读到 `blk` 字节就立刻写给客户端一次，
+        而不是攒够整个分片（20MB）再发——后者会让播放器每到一个分片边界就干等
+        一整片的下载时间（真实网络下 2~10s），表现为周期性卡顿。
+
+        ``blk`` 缺省由 ``TG_STREAM_BLOCK_KB`` 决定（默认 256KB）：越小数据到达越平滑、
+        起播/seek 首字节越快。
+
+        完整分片(verify=True)会增量计算 SHA-256 并在分片末尾比对（边发边校验），
+        不符立即抛 _IntegrityError 中断连接；Range 切开的片段(verify=False)只转发不校验。
         返回实际写出的字节数，供收尾日志统计吞吐。
         """
         ci, c, cstart, cend, rs, re_, verify = entry
         h = hashlib.sha256() if verify else None
         sent = 0
+        nblk = 0
+        t_first = None
         try:
             for block in self.app.backend.iter_chunk(
-                c["file_id"], c.get("slot", 0), rs, re_
+                c["file_id"], c.get("slot", 0), rs, re_, blk=blk
             ):
+                if t_first is None:
+                    t_first = time.time()
                 if h is not None:
                     h.update(block)
                 try:
                     self.wfile.write(block)
                     sent += len(block)
+                    nblk += 1
                 except (ConnectionError, OSError):
                     # 客户端中途断开：抛出内部信号，让调用方立刻停止（不再等其余分片）
                     raise _ClientGone(sent)
@@ -771,7 +783,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             raise
         if h is not None and h.hexdigest() != c.get("sha256"):
             raise _IntegrityError(cstart)
-        return sent
+        return sent, nblk, t_first
 
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
@@ -889,9 +901,13 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         # 单文件固定单线程下载（参数 `workers` 暂留以兼容日志，但实际不再开线程池）
         workers = 1
+        # 播放关键参数：stream_all=全分片流式(默认)，blk=流式读块大小
+        stream_all = getattr(self.app.config, "stream_all_chunks", True)
+        blk = max(16, int(getattr(self.app.config, "stream_block_kb", 256))) * 1024
         _log(f"GET 单线程下载: path={path} 需拉分片={len(plan)} "
              f"Range={self.headers.get('Range')} "
-             f"(原并发版会触发 keep-alive 池互锁/单bot限流/分片间result阻塞，已改为串行)")
+             f"模式={'全分片流式' if stream_all else '仅首片流式(其余整片缓冲)'} "
+             f"读块={blk // 1024}KB")
 
         def _fmt_speed_local(n, dt):
             if not dt or dt <= 0:
@@ -910,22 +926,34 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         tl = []  # (ci, 下载耗时, 写回耗时, 分片间隔, 字节数)
         last_done = time.time()  # 上一片处理完（写回客户端）的时刻
         try:
-            if rest:
-                # 首片流式转发（边下边发，立刻有首字节）
+            # 首片：始终流式转发（边下边发，让客户端尽快拿到首字节）
+            t_dl = time.time()
+            n_first, nblk_first, tfb = self._stream_chunk(first, blk)
+            dl_t = time.time() - t_dl
+            sent += n_first
+            tl.append((first[0], dl_t, 0.0, 0.0, n_first))
+            _log(f"GET 分片[{first[0]}](首) 流式完成: 耗时={dl_t:.3f}s "
+                 f"大小={_fmt_size(n_first)}({n_first}B) 块数={nblk_first} "
+                 f"吞吐={_fmt_speed_local(n_first, dl_t)} "
+                 f"首字节延迟={(tfb - t_dl):.3f}s(本片内) TTFB={(tfb - t0):.3f}s(自请求起)")
+            last_done = time.time()
+            # 其余分片：默认同样流式下发（播放丝滑的关键）；
+            # 仅在 TG_STREAM_ALL_CHUNKS=off 时退回「整片缓冲后一次性写出」的旧行为。
+            for entry in rest:
+                ci, c, cstart, cend, rs, re_, verify = entry
                 t_dl = time.time()
-                sent = self._stream_chunk(first)
-                dl_t = time.time() - t_dl
-                tl.append((first[0], dl_t, 0.0, 0.0, sent))
-                _log(f"GET 分片[{first[0]}](首) 下载完成: 下载耗时={dl_t:.3f}s "
-                     f"大小={_fmt_size(sent)}({sent}B) 吞吐={_fmt_speed_local(sent, dl_t)} "
-                     f"TTFB后延迟={time.time() - t0:.3f}s")
-                last_done = time.time()
-                # 剩余分片：主线程串行下载 → 校验 → 回写，零线程竞争 / 零 result() 串行阻塞
-                for ci, c, cstart, cend, rs, re_, verify in rest:
-                    t_dl = time.time()
+                gap = t_dl - last_done  # 上片写回完 → 本片开始下载之间的间隔（卡顿核心指标）
+                if stream_all:
+                    n_sent, nblk, tfb = self._stream_chunk(entry, blk)
+                    dl_t = time.time() - t_dl
+                    tl.append((ci, dl_t, 0.0, gap, n_sent))
+                    _log(f"GET 分片[{ci}] 流式完成: 耗时={dl_t:.3f}s 分片间隔={gap:.3f}s "
+                         f"大小={_fmt_size(n_sent)}({n_sent}B) 块数={nblk} "
+                         f"吞吐={_fmt_speed_local(n_sent, dl_t)}")
+                    sent += n_sent
+                else:
                     _, data = _collect(ci, c, rs, re_)
                     dl_t = time.time() - t_dl
-                    gap = t_dl - last_done  # 上片写回完 → 本片开始下载之间的间隔（卡顿核心指标）
                     if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
                         raise _IntegrityError(cstart)
                     t_wr = time.time()
@@ -933,21 +961,14 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                         self.wfile.write(data)
                         sent += len(data)
                     except (ConnectionError, OSError):
-                        # 客户端中途断开：立刻停止（不需要 cancel 线程池了）
                         raise _ClientGone(sent)
                     wr_t = time.time() - t_wr
                     tl.append((ci, dl_t, wr_t, gap, len(data)))
-                    _log(f"GET 分片[{ci}] 下载完成: 下载耗时={dl_t:.3f}s 写回耗时={wr_t:.3f}s "
-                         f"分片间隔={gap:.3f}s 大小={_fmt_size(len(data))}({len(data)}B) "
+                    _log(f"GET 分片[{ci}] 缓冲后写出: 下载耗时={dl_t:.3f}s "
+                         f"写回耗时={wr_t:.3f}s 分片间隔={gap:.3f}s "
+                         f"大小={_fmt_size(len(data))}({len(data)}B) "
                          f"吞吐={_fmt_speed_local(len(data), dl_t)}")
-                    last_done = time.time()
-            else:
-                t_dl = time.time()
-                sent = self._stream_chunk(first)
-                dl_t = time.time() - t_dl
-                tl.append((first[0], dl_t, 0.0, 0.0, sent))
-                _log(f"GET 分片[{first[0]}](首) 下载完成: 下载耗时={dl_t:.3f}s "
-                     f"大小={_fmt_size(sent)}({sent}B) 吞吐={_fmt_speed_local(sent, dl_t)}")
+                last_done = time.time()
         except _ClientGone as e:
             _log(f"GET 客户端提前断开(已停止): path={path} 已发={_fmt_size(sent)} "
                  f"耗时={time.time() - t0:.2f}s 吞吐={_fmt_speed(sent, time.time() - t0)}")
