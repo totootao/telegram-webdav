@@ -62,6 +62,69 @@ def _now_iso(ts):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _fmt_dur(sec):
+    """秒(float) -> 人类可读时长 ``H:MM:SS.mmm``；无法表示返回 ``-``。
+
+    日志里同时会带原始秒数，便于定位；这里只负责把「5023.678s」变成「1:23:43.678」。
+    """
+    if sec is None:
+        return "-"
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError):
+        return "-"
+    if sec < 0:
+        return "-"
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = sec % 60
+    if h:
+        return f"{h:d}:{m:02d}:{s:06.3f}"
+    return f"{m:d}:{s:06.3f}"
+
+
+def _fmt_size(n):
+    """字节数 -> ``45.2MB`` 这类可读串。"""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1024.0:
+            return f"{n:.0f}{unit}" if unit == "B" else f"{n:.1f}{unit}"
+        n /= 1024.0
+    return f"{n:.1f}PB"
+
+
+def _fmt_speed(nbytes, seconds):
+    """吞吐：``(字节数, 耗时秒) -> '12.3 MB/s'``。耗时过小/无效时返回 ``-``。"""
+    try:
+        seconds = float(seconds)
+        if seconds <= 0:
+            return "-"
+        return f"{nbytes / seconds / (1024 * 1024):.1f} MB/s"
+    except (TypeError, ValueError, ZeroDivisionError):
+        return "-"
+
+
+def _media_kind(content_type, name=""):
+    """按 Content-Type / 扩展名判断是音频还是视频，返回 'video'/'audio'/'-'。
+
+    只用于日志标注，非媒体返回 ``-``（时长解析自然也不会有结果）。
+    """
+    ct = (content_type or "").split(";")[0].strip().lower()
+    if ct.startswith("video/"):
+        return "video"
+    if ct.startswith("audio/"):
+        return "audio"
+    ext = name.rsplit(".", 1)[-1].lower() if name and "." in name else ""
+    if ext in ("mp4", "m4v", "mov", "mkv", "webm", "ogv", "3gp", "3g2", "avi"):
+        return "video"
+    if ext in ("mp3", "m4a", "m4b", "flac", "wav", "wave", "ogg", "oga", "opus", "spx"):
+        return "audio"
+    return "-"
+
+
 # 请求体读取超时（秒）。防止 Content-Length 虚高时把线程拖死。空闲 keep-alive
 # 等待上限改为从配置读取（DAV_IDLE_TIMEOUT，默认 30），便于自测调小、生产按需放大。
 _BODY_TIMEOUT = 300.0
@@ -86,6 +149,18 @@ class _IntegrityError(Exception):
     def __init__(self, offset):
         super().__init__("integrity check failed")
         self.offset = offset
+
+
+class _ClientGone(Exception):
+    """客户端在流式下载途中断开连接。
+
+    抛出后由 ``_serve_file`` 捕获：立刻停止，不再等待其余分片下载完（省掉无谓的等待与流量）。
+    """
+
+    def __init__(self, sent=0):
+        super().__init__("client gone")
+        self.sent = sent
+
 
 # 常见 HTTP/WebDAV 方法。用于判断缓冲区开头是「一条新请求」（流水线，不能动）
 # 还是「上一条请求多出来的垃圾字节」（可以安全丢掉）。
@@ -675,9 +750,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         用于「首字节尽快到达」场景（降低 TTFB）。完整分片(verify=True)会增量计算 SHA-256
         并在结束后比对；Range 切开的片段(verify=False)只转发不校验。
+        返回实际写出的字节数，供收尾日志统计吞吐。
         """
         ci, c, cstart, cend, rs, re_, verify = entry
         h = hashlib.sha256() if verify else None
+        sent = 0
         try:
             for block in self.app.backend.iter_chunk(
                 c["file_id"], c.get("slot", 0), rs, re_
@@ -686,13 +763,15 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     h.update(block)
                 try:
                     self.wfile.write(block)
+                    sent += len(block)
                 except (ConnectionError, OSError):
-                    # 客户端中途断开，静默结束
-                    return
+                    # 客户端中途断开：抛出内部信号，让调用方立刻停止（不再等其余分片）
+                    raise _ClientGone(sent)
         except _tg.TGError:
             raise
         if h is not None and h.hexdigest() != c.get("sha256"):
             raise _IntegrityError(cstart)
+        return sent
 
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
@@ -714,11 +793,17 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 b"301 Moved Permanently",
             )
             return
-        _log(f"GET 开始{' (HEAD)' if head_only else ''}: path={path} size={node['size']} "
-             f"分片数={len(node.get('chunks') or [])} Range={self.headers.get('Range')}")
-
         total = node["size"]
+        # 先解析再记日志：node['chunks'] 是 JSON 字符串，直接 len() 会数成字符数
         chunks = json.loads(node["chunks"]) if node.get("chunks") else []
+
+        t0 = time.time()
+        dur = node.get("duration")
+        _log(f"GET 开始{' (HEAD)' if head_only else ''}: path={path} size={_fmt_size(total)} "
+             f"分片数={len(chunks)} Range={self.headers.get('Range')} "
+             f"类型={_media_kind(node.get('content_type'), path.rsplit('/', 1)[-1])} "
+             f"时长={_fmt_dur(dur)}"
+             f"{'(' + f'{dur:.3f}s' + ')' if dur is not None else ''}")
 
         rng = self._parse_range(total) if not head_only else None
         if rng == "invalid":
@@ -797,15 +882,18 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return ci, data
 
         rest_futs = {}
+        sent = 0
         try:
             if rest:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+                # 显式线程池：结束时用 shutdown(wait=False)，客户端断开时不再干等其余分片下载
+                ex = concurrent.futures.ThreadPoolExecutor(max_workers=max(1, workers))
+                try:
                     for ci, c, _, _, rs, re_, _ in rest:
                         rest_futs[ci] = ex.submit(_collect, ci, c, rs, re_)
                     # 首片先流式写出（边下边发，立刻有首字节）
                     try:
-                        self._stream_chunk(first)
-                    except _tg.TGError:
+                        sent = self._stream_chunk(first)
+                    except (_tg.TGError, _ClientGone):
                         for f in rest_futs.values():
                             f.cancel()
                         raise
@@ -821,22 +909,38 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                             raise _IntegrityError(cstart)
                         try:
                             self.wfile.write(data)
+                            sent += len(data)
                         except (ConnectionError, OSError):
-                            # 客户端中途断开，静默结束
-                            return
+                            for f in rest_futs.values():
+                                f.cancel()
+                            raise _ClientGone(sent)
+                finally:
+                    ex.shutdown(wait=False)
             else:
                 # 单分片：直接流式转发
-                self._stream_chunk(first)
+                sent = self._stream_chunk(first)
+        except _ClientGone as e:
+            _log(f"GET 客户端提前断开(已停止): path={path} 已发={_fmt_size(sent)} "
+                 f"耗时={time.time() - t0:.2f}s 吞吐={_fmt_speed(sent, time.time() - t0)}")
+            self.close_connection = True
+            return
         except _IntegrityError as e:
             # 分片内容与上传时记录的不一致（Telegram 返回了损坏/截断的字节，或数据被污染）：
             # 已经可能发了一部分脏数据，立刻中断连接，绝不把错数据当完整文件交给客户端。
             _log(f"GET 分片完整性校验失败(中断连接): path={path} @offset {e.offset} "
+                 f"已发={_fmt_size(sent)} "
                  f"说明=内容不符或被截断（Telegram 返回字节与原 file_id 记录的 sha256 不符）")
             self.close_connection = True
             return
         except _tg.TGError as e:
-            _log(f"GET 下载分片失败(连接中断): path={path} 错误={e}")
+            _log(f"GET 下载分片失败(连接中断): path={path} 错误={e} 已发={_fmt_size(sent)}")
             self.close_connection = True
+            return
+        _log(f"GET 完成: path={path} 状态={status} 区间={start}-{end}/{total} "
+             f"已发={_fmt_size(sent)}({sent}B) 耗时={time.time() - t0:.2f}s "
+             f"吞吐={_fmt_speed(sent, time.time() - t0)} 并发={workers} "
+             f"类型={_media_kind(content_type, path.rsplit('/', 1)[-1])} "
+             f"时长={_fmt_dur(dur)}")
 
     # ---------------- PUT ----------------
     def do_PUT(self):
@@ -852,6 +956,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self._send(503, {"Content-Type": "text/plain; charset=utf-8"},
                        "Telegram 未配置，无法存储".encode("utf-8"))
             return
+        t0 = time.time()
         _log(f"PUT 收到: path={path} Content-Length={self.headers.get('Content-Length')} "
              f"Transfer-Encoding={self.headers.get('Transfer-Encoding')} "
              f"Content-Type={self.headers.get('Content-Type')} "
@@ -964,15 +1069,25 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         # 媒体时长（音频/视频）：本地解析，Telegram 侧仍是原字节存储，不影响分片与哈希。
         # 解析失败一律吞掉——绝不能因为元数据解析影响上传结果。
         duration = None
+        dur_fmt = None
         if total > 0:
             try:
-                duration = _media.probe_duration(
+                duration, dur_fmt = _media.probe_duration_detail(
                     head_sample, tail_sample, total, path.rsplit("/", 1)[-1]
                 )
             except Exception as e:
                 # 文件头异常（非媒体 / 截断 / 格式无法解析）：仅影响时长元数据，不影响上传
                 _log(f"PUT 媒体时长解析异常(已忽略,不影响上传): path={path} err={type(e).__name__}: {e}")
                 duration = None
+        # 音视频时长日志：识别出容器才打印「可读时长 + 容器」，否则明确说明未识别，
+        # 便于一眼区分「非媒体文件」与「媒体文件但解析失败」。
+        kind = _media_kind(ct, path.rsplit("/", 1)[-1])
+        if duration is not None:
+            _log(f"PUT 媒体解析: path={path} 类型={kind} 容器={dur_fmt} "
+                 f"时长={_fmt_dur(duration)}({duration:.3f}s)")
+        elif kind in ("audio", "video"):
+            _log(f"PUT 媒体解析: path={path} 类型={kind} 未能解析出时长"
+                 f"(采样不足/非标准封装/加密moov)，不影响上传")
 
         try:
             self.app.db.create_file(
@@ -988,8 +1103,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                        f"元数据写入失败: {e}".encode("utf-8"))
             return
         _log(f"PUT 完成: path={path} 状态={'覆盖(204)' if existed else '新建(201)'} "
-             f"size={total}B 分片数={len(chunks_meta)} content_type={ct} "
-             f"duration={duration} file_hash={'有' if total > 0 else '无(空文件)'}")
+             f"size={_fmt_size(total)}({total}B) 分片数={len(chunks_meta)} content_type={ct} "
+             f"时长={_fmt_dur(duration)}"
+             f"{'(' + f'{duration:.3f}s' + ')' if duration is not None else ''} "
+             f"耗时={time.time() - t0:.2f}s 吞吐={_fmt_speed(total, time.time() - t0)} "
+             f"file_hash={'有' if total > 0 else '无(空文件)'}")
         self._send(204 if existed else 201, {"Content-Type": "text/plain"})
 
     # ---------------- DELETE ----------------

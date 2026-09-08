@@ -117,6 +117,31 @@ WebDAV 客户端 ──PROPFIND/GET/PUT──▶ TelegramWebDAV (本服务)
 
 命名空间为 `urn:telegram-webdav:meta`，不支持该属性的客户端会自动忽略。
 
+### 音视频时长日志
+
+PUT 上传时会打印解析结果（类型 / 容器 / 可读时长）：
+
+```
+[webdav] PUT 媒体解析: path=/movie/a.mp4 类型=video 容器=mp4 时长=1:23:43.678(5023.678s)
+[webdav] PUT 完成: path=/movie/a.mp4 状态=新建(201) size=1.2GB(1312345678B) 分片数=61
+         content_type=video/mp4 时长=1:23:43.678(5023.678s) 耗时=42.31s 吞吐=29.4 MB/s file_hash=有
+```
+
+GET / 播放时同样带时长，并附上本次请求的耗时与吞吐：
+
+```
+[webdav] GET 开始: path=/movie/a.mp4 size=1.2GB 分片数=61 Range=bytes=0- 类型=video 时长=1:23:43.678(5023.678s)
+[webdav] GET 完成: path=/movie/a.mp4 状态=206 区间=0-1312345677/1312345678 已发=1.2GB(1312345678B)
+         耗时=38.02s 吞吐=32.9 MB/s 并发=5 类型=video 时长=1:23:43.678
+```
+
+- `类型` 由 Content-Type 或扩展名判断（`video` / `audio` / `-` 表示非媒体）。
+- `容器` 是实际解析成功的封装（mp4 / mkv / webm / mp3 / flac / wav / ogg），
+  用来确认走的是哪条解析分支。
+- 媒体文件但**解析不出时长**时会明确打印
+  `未能解析出时长(采样不足/非标准封装/加密moov)`，与非媒体文件（`时长=-`）区分开。
+- `耗时` / `吞吐` 用于定位慢在哪：吞吐低说明瓶颈在网络或代理；耗时高但吞吐正常说明是连接建立慢。
+
 **已知局限**：
 
 - **OGG 视频（Theora）不支持**：它的 granule 编码了帧号与关键帧偏移，换算规则另有一套，返回 `None`

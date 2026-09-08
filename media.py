@@ -371,13 +371,15 @@ def _ogg(head, tail):
 
 
 # ---------------------------------------------------------------- 入口
-def probe_duration(head, tail, size, name=""):
-    """从采样字节里判断媒体时长，返回秒（float）；无法判断返回 None。
+def probe_duration_detail(head, tail, size, name=""):
+    """从采样字节里判断媒体时长，返回 ``(seconds, fmt)``。
 
     :param head: 文件头部采样字节
     :param tail: 文件尾部采样字节
     :param size: 文件总字节数（MP3 的 CBR 估算需要）
     :param name: 文件名，仅用于取扩展名做提示
+    :return: ``(秒 float, 容器名 str)``；无法判断返回 ``(None, None)``。
+             容器名（mp4/mkv/mp3/flac/wav/ogg…）用于日志，方便确认解析走的是哪条分支。
     """
     ext = name.rsplit(".", 1)[-1].lower() if name and "." in name else ""
 
@@ -385,53 +387,58 @@ def probe_duration(head, tail, size, name=""):
     if ext in ("wav", "wave"):
         d = _wav(head, size)
         if d:
-            return d
+            return d, "wav"
     elif ext == "flac":
         d = _flac(head, size)
         if d:
-            return d
+            return d, "flac"
     elif ext == "mp3":
         d = _mp3(head, size)
         if d:
-            return d
+            return d, "mp3"
     elif ext in ("mp4", "m4a", "m4b", "m4v", "mov", "3gp", "3g2"):
         d = _mp4(head, tail)
         if d:
-            return d
+            return d, ext
     elif ext in ("mkv", "webm"):
         d = _mkv(head, tail)
         if d:
-            return d
+            return d, ext
     elif ext in ("ogg", "oga", "opus", "ogv", "ogx", "spx"):
         d = _ogg(head, tail)
         if d:
-            return d
+            return d, ext
 
     # 2) 魔数嗅探（扩展名缺失或不靠谱时兜底）
     if head[:4] == b"fLaC":
         d = _flac(head, size)
         if d:
-            return d
+            return d, "flac"
     if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
         d = _wav(head, size)
         if d:
-            return d
+            return d, "wav"
     if len(head) >= 8 and head[4:8] in _FTYP_LIKE:
         d = _mp4(head, tail)
         if d:
-            return d
+            return d, "mp4"
     if head[:4] == _EBML_MAGIC:
         d = _mkv(head, tail)
         if d:
-            return d
+            return d, "mkv/webm"
     if head[:4] == _OGG_MAGIC:
         d = _ogg(head, tail)
         if d:
-            return d
+            return d, "ogg"
     if head[:3] == b"ID3" or (
         len(head) >= 2 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0
     ):
         d = _mp3(head, size)
         if d:
-            return d
-    return None
+            return d, "mp3"
+    return None, None
+
+
+def probe_duration(head, tail, size, name=""):
+    """probe_duration_detail 的简版：只返回秒（float）；无法判断返回 None。"""
+    return probe_duration_detail(head, tail, size, name)[0]
