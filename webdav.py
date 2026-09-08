@@ -747,7 +747,43 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self.send_response_only(100)
             self.end_headers()
 
-        total = int(self.headers.get("Content-Length", 0) or 0)
+        # 读取请求体：优先用 Content-Length；若缺失则回退到 chunked 或流式读取。
+        # 某些 WebDAV 客户端（Windows 资源管理器 / 特定配置的 rclone）可能不发送
+        # Content-Length 头，此时必须通过 Transfer-Encoding 或 EOF 判断边界，
+        # 否则 total=0 导致 while 循环不执行、文件数据静默丢失（创建空文件）。
+        te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+        cl_hdr = self.headers.get("Content-Length")
+        if cl_hdr is not None:
+            total = int(cl_hdr) or 0
+            # 有 Content-Length：按精确长度读取
+            body_data = b""
+            if total > 0:
+                body_data = self._read_exact(total)
+                if len(body_data) != total:
+                    raise _tg.TGError("请求体长度不足（客户端提前断开）")
+        elif "chunked" in te:
+            # chunked 编码：读全部块后拼接
+            body_data = self._read_chunked()
+            total = len(body_data)
+        else:
+            # 既无 CL 也非 chunked：对 PUT 方法尝试流式读取直到 EOF（短连接）
+            # 注意：keep-alive 下无法安全判断 EOF，此处做最大努力读取
+            body_data = b""
+            try:
+                while True:
+                    self.connection.settimeout(self._read_timeout)
+                    part = self.rfile.read(65536)
+                    if not part:
+                        break
+                    body_data += part
+                    self._body_read += len(part)
+            finally:
+                try:
+                    self.connection.settimeout(self.app.config.idle_timeout)
+                except Exception:
+                    pass
+            total = len(body_data)
+
         ct = self.headers.get("Content-Type", "").split(";")[0].strip()
         if not ct:
             ct = _guess_ct(path.rsplit("/", 1)[-1])
@@ -764,17 +800,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         head_sample = b""  # 首片头部采样（解析媒体时长用）
         tail_sample = b""  # 末片尾部采样
         try:
-            remaining = total
-            while remaining > 0:
-                want = min(chunk_size, remaining)
-                buf = b""
-                while len(buf) < want:
-                    part = self._read_exact(want - len(buf))
-                    if not part:
-                        break
-                    buf += part
-                if len(buf) != want:
-                    raise _tg.TGError("请求体长度不足（客户端提前断开）")
+            # 将完整请求体按 chunk_size 切片上传到 Telegram
+            offset = 0
+            while offset < total:
+                want = min(chunk_size, total - offset)
+                buf = body_data[offset:offset + want]
                 if ci == 0:
                     head_sample = buf[:_MEDIA_HEAD_SAMPLE]
                 file_hash.update(buf)
@@ -788,8 +818,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     {"file_id": fid, "slot": slot, "size": len(buf),
                      "message_id": mid, "sha256": chunk_sha}
                 )
-                remaining -= len(buf)
-                if remaining == 0:
+                offset += len(buf)
+                if offset >= total:
                     tail_sample = buf[-_MEDIA_TAIL_SAMPLE:]
                 ci += 1
             # 清理残留字节（AList 类 CL 少算），必要时关闭连接
