@@ -181,6 +181,28 @@ python3 selftest.py
 
 ---
 
+## 客户端兼容性（AList / OpenList 挂载）
+
+在 AList v3.64（OpenList 同源）里把本服务挂成 WebDav 存储即可正常读写：
+
+| 操作 | AList 侧表现 | 备注 |
+| --- | --- | --- |
+| 挂载后首次列目录 | 正常 | WebDav 地址必须**以 `/` 结尾**，例如 `http://ip:8080/` |
+| 新建文件夹（单层 / 嵌套） | 正常 | `MKCOL`，父目录不存在时按规范返回 409 |
+| 上传 / 下载文件 | 正常 | 走 `PUT` / `GET`，支持 Range |
+| 删除文件 / 文件夹 | 正常 | 服务端递归删元数据；Telegram 侧的物理分片仍留频道 |
+
+> **踩过的坑**：AList 的 WebDav 驱动构造 PROPFIND 的 XML body 时，`Content-Length`
+> 比真实 body 少算 1 字节（尾部那个 `\n` 没算进去）。在 keep-alive 下，这个残留字节
+> 会被服务端当成下一个请求的起始行，于是吐出 Python 自带的 HTML 400 页，客户端报
+> `malformed HTTP status code "HTML>"`，表现为「首次能连上、创建/删除全失败」。
+>
+> 本项目的处理：**每次请求结束后读净请求体并关闭连接**（响应带 `Connection: close`），
+> 从根上消除请求边界错位。代价是每个请求一次 TCP 握手，而本服务的瓶颈在 Telegram 的
+> 1 msg/s 限流，这点开销可以忽略。
+
+---
+
 ## 限制 / 注意
 
 - **删除不可逆**：Telegram 不支持删除已发消息，DELETE 只删本地元数据，物理分片仍占频道空间（清频道即可彻底释放）。

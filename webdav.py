@@ -66,6 +66,90 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
+    # ---------------- 请求体卫生（keep-alive 兼容） ----------------
+    def __init__(self, *args, **kwargs):
+        self._body_read = 0
+        self._hdr_status = 0
+        self._hdr_conn_sent = False
+        super().__init__(*args, **kwargs)
+
+    def handle_one_request(self):
+        """每个请求处理完都确保读净请求体。"""
+        self._body_read = 0
+        try:
+            super().handle_one_request()
+        finally:
+            self._drain_body()
+
+    def send_response(self, code, message=None):
+        """每条连接只服务一个请求。
+
+        AList / OpenList 的 WebDav 驱动构造 PROPFIND 的 XML body 时，
+        Content-Length 比真实 body 少算 1 个字节（尾部那个 \\n 没算进去）。
+        keep-alive 下，这个残留字节会被服务端当成下一个请求的起始行，
+        于是吐出 Python 自带的 HTML 400 错误页，客户端侧表现就是
+        `malformed HTTP status code "HTML>"`。
+        请求处理完即关闭连接，可以从根上杜绝这类边界错位。
+        """
+        self._hdr_status = code
+        self._hdr_conn_sent = False
+        self.close_connection = True
+        super().send_response(code, message)
+
+    def end_headers(self):
+        if self._hdr_status >= 200 and not self._hdr_conn_sent:
+            self._hdr_conn_sent = True
+            try:
+                self.send_header("Connection", "close")
+            except Exception:
+                pass
+        super().end_headers()
+
+    def _read_body(self, n):
+        """读取请求体并记账（PUT 流式上传用）。"""
+        data = self.rfile.read(n)
+        self._body_read += len(data)
+        return data
+
+    def _drain_body(self):
+        """丢弃尚未读取的请求体。
+
+        Go / Alist / rclone 等客户端在 PROPFIND、MKCOL、DELETE 里也会带 XML body，
+        而 401/404/409 这类提前返回的分支从不读它。残留的 body 会被当成下一个
+        请求的起始行来解析，服务端于是吐出 Python 自带的 HTML 400 页
+        （`<!DOCTYPE HTML>` … `Bad HTTP/0.9 request type`），连接就此错乱 ——
+        客户端侧表现为 `malformed HTTP status code "HTML>"`。
+
+        另外给读取加了超时：某些客户端声称的 Content-Length 比真实 body 大，
+        死等会把线程拖死 —— 读不净就直接关连接（反正每条连接只用一次）。
+        """
+        try:
+            te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+            # 给读取加个短超时，避免 Content-Length 虚高时在这里卡死
+            try:
+                self.connection.settimeout(1.0)
+            except Exception:
+                pass
+            if "chunked" in te:
+                # 一路读到 0\r\n 块或 EOF
+                while True:
+                    line = self.rfile.readline(65536)
+                    if not line or line in (b"\r\n", b"\n"):
+                        break
+                return
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is None:
+                return
+            left = int(raw_len) - getattr(self, "_body_read", 0)
+            while left > 0:
+                part = self.rfile.read(min(left, 262144))
+                if not part:
+                    break
+                left -= len(part)
+        except Exception:
+            # 读不干净就让这条连接死掉，宁可重建连接也不要留下脏数据
+            self.close_connection = True
+
     def _auth_ok(self):
         cfg = self.app.config
         if not cfg.auth_enabled:
@@ -336,7 +420,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 want = min(chunk_size, remaining)
                 buf = b""
                 while len(buf) < want:
-                    part = self.rfile.read(want - len(buf))
+                    part = self._read_body(want - len(buf))
                     if not part:
                         break
                     buf += part
