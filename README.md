@@ -81,6 +81,7 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_CHAT_ID` | 频道/群组 chat_id（单 bot 模式） | 空 |
 | `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId"}]`；分摊 1 msg/s 流控 | 空 |
 | `TG_API_BASE` | Telegram API 代理基址（国内/被墙用） | `https://api.telegram.org` |
+| `TG_PROXY_TOKEN` | 自建代理的鉴权令牌，以 `Authorization: Bearer` 头发出；官方 API 场景留空 | 空 |
 | `CHUNK_SIZE_MB` | 分片大小（≤20 即可走官方 Bot API；自建 Bot API Server 可到 2000） | `20` |
 | `DB_PATH` | SQLite 文件路径 | `./telegram_webdav.db` |
 | `DAV_USER` / `DAV_PASSWORD` | Basic 认证（建议必填） | 空（关闭认证） |
@@ -160,6 +161,23 @@ docker run -d -p 8080:8080 -v $PWD/data:/data telegram-webdav
 python3 selftest.py
 ```
 预期输出 `结果: 28/28 通过`。
+
+### 真实环境已验证
+
+用真实 bot + 频道 + 自建 API 代理（`TG_API_BASE` + `TG_PROXY_TOKEN`）跑过端到端：
+
+| 场景 | 结果 |
+| --- | --- |
+| 45MB 文件 PUT | 自动切成 3 片（20+20+5MB）落进频道，完整回读 MD5 一致 |
+| HTTP Range（`bytes=1M-2M` 跨片、`bytes=44M-` 尾部） | 206 + 字节级一致 |
+| 空文件 PUT / GET | 0 字节占位，回读 size=0 |
+| MOVE / COPY / DELETE / PROPFIND Depth 1 | 正常；COPY 共享 `file_id`，45MB 副本 0.04 秒生成且不重复上传 |
+| Basic 认证 | 无凭据 / 错误口令均 401 |
+| 并发 4 路 PUT + 回读 | MD5 全部一致 |
+| rclone 1.68（WebDAV 后端） | `copy` 整个目录、`check` 0 differences、回读 `diff -r` 无差异 |
+
+> 注意：自建 API 代理若套了 Cloudflare，默认的 `Python-urllib/x.y` UA 会被拦（403 / error code 1010）。
+> 本项目已把 UA 固定为 `TelegramWebDAV/1.0 (+python-urllib)`，无需额外配置。
 
 ---
 

@@ -595,7 +595,8 @@ class App:
         self.db = _db.MetaStore(self.config.db_path)
         self.backend = (
             _tg.TelegramBackend(
-                self.config.slots, self.config.api_base, self.config.rate_limit
+                self.config.slots, self.config.api_base, self.config.rate_limit,
+                self.config.proxy_token,
             )
             if self.config.slots
             else None

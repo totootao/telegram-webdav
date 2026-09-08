@@ -57,21 +57,35 @@ def _build_multipart(boundary, fields, files):
 
 
 class TelegramBackend:
-    def __init__(self, slots, api_base="https://api.telegram.org", rate_limit=1.0):
+    def __init__(self, slots, api_base="https://api.telegram.org", rate_limit=1.0,
+                 proxy_token=None):
         self.slots = slots  # [{"token","chat_id"}]
         self.api_base = api_base.rstrip("/")
         self.rate_limit = float(rate_limit)
+        # 自建 TG API 代理需要的访问令牌（官方 API 场景留空）
+        self.proxy_token = (proxy_token or "").strip() or None
         self._lock = threading.Lock()
         self._last = {}  # slot idx -> 上次发送时间
         self._path_cache = {}  # file_id -> (file_path, expire_ts)
         self._path_cache_ttl = 50 * 60  # TG file_path 有效期 1h，缓存 50min
 
-    # ---------- URL ----------
+    # ---------- URL / 认证 ----------
     def _api_url(self, token, method):
         return f"{self.api_base}/bot{token}/{method}"
 
     def _file_url(self, token, file_path):
         return f"{self.api_base}/file/bot{token}/{file_path}"
+
+    def _prepare(self, req):
+        """统一装配请求：代理鉴权 + 自定义 UA。
+
+        urllib 默认的 ``Python-urllib/x.y`` 会被 Cloudflare 等 WAF 直接 403
+        （error code 1010），所以这里换成固定的 UA。
+        """
+        req.add_header("User-Agent", "TelegramWebDAV/1.0 (+python-urllib)")
+        if self.proxy_token:
+            req.add_header("Authorization", f"Bearer {self.proxy_token}")
+        return req
 
     # ---------- 限流 ----------
     def _rate_wait(self, idx):
@@ -126,6 +140,7 @@ class TelegramBackend:
         url = self._api_url(slot["token"], "sendDocument")
         req = urllib.request.Request(url, data=body, method="POST")
         req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+        self._prepare(req)
         last = None
         for attempt in range(retries):
             try:
@@ -179,7 +194,8 @@ class TelegramBackend:
         url = self._api_url(token, "getFile") + "?file_id=" + urllib.parse.quote(file_id)
         for attempt in range(3):
             try:
-                with urllib.request.urlopen(url, timeout=30) as resp:
+                req = self._prepare(urllib.request.Request(url))
+                with urllib.request.urlopen(req, timeout=30) as resp:
                     js = json.loads(resp.read().decode("utf-8", "replace"))
                 if not js.get("ok"):
                     raise TGError(f"getFile: {js.get('error_code')} {js.get('description')}")
@@ -206,7 +222,7 @@ class TelegramBackend:
         token = self.slots[slot % n]["token"]
         fp = self._get_file_path(file_id, token)
         url = self._file_url(token, fp)
-        req = urllib.request.Request(url)
+        req = self._prepare(urllib.request.Request(url))
         if start is not None:
             rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
             req.add_header("Range", rng)

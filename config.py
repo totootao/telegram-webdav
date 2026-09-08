@@ -72,6 +72,9 @@ class Config:
         self.api_base = os.environ.get(
             "TG_API_BASE", "https://api.telegram.org"
         ).rstrip("/")
+        # 自建 Telegram API 代理（如 tg.<domain>/tg）若额外要求认证，用此令牌
+        # 以 Authorization: Bearer <token> 头发送；官方 api.telegram.org 下不需要，留空即可。
+        self.proxy_token = (os.environ.get("TG_PROXY_TOKEN") or "").strip()
         self.slots = _load_pools()
         self.auth_user = os.environ.get("DAV_USER")
         self.auth_password = os.environ.get("DAV_PASSWORD")
@@ -91,6 +94,7 @@ class Config:
             "db_path": self.db_path,
             "chunk_size_mb": self.chunk_size // (1024 * 1024),
             "api_base": self.api_base,
+            "proxy_auth": "on" if self.proxy_token else "off",
             "bot_slots": len(self.slots),
             "auth": "on" if self.auth_enabled else "off",
             "import_dir": self.import_dir,
