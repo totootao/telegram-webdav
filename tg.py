@@ -18,6 +18,7 @@ TG_API_BASE：可指向自建代理（国内/被墙场景），所有请求加�
 """
 import base64
 import collections
+import concurrent.futures
 import datetime
 import http.client
 import json
@@ -512,6 +513,70 @@ class TelegramBackend:
                     continue
                 raise TGError(f"getFile: {e}")
         raise TGError("getFile 失败")
+
+    def _get_file_path_direct(self, file_id, token, api_base=None, proxy_token=None):
+        """不走连接池的 getFile（专供预取用，避免与下载线程争用 keep-alive 连接）。
+
+        与 _get_file_path 的唯一区别是用一次性 urllib 请求，不从 _conn_pool 取连接，
+        这样预取线程和下载线程互不影响。命中缓存时直接返回（零开销）。
+        """
+        now = time.time()
+        cached = self._path_cache.get(file_id)
+        if cached and cached[1] > now:
+            return cached[0]
+        base = (api_base or self.api_base).rstrip("/")
+        url = f"{base}/bot{token}/getFile?file_id=" + urllib.parse.quote(file_id)
+        req = urllib.request.Request(url)
+        req.add_header("User-Agent", "TelegramWebDAV/1.0 (+python-urllib)")
+        if proxy_token:
+            req.add_header("Authorization", f"Bearer {proxy_token}")
+        t0 = time.time()
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+        js = json.loads(raw)
+        if not js.get("ok"):
+            raise TGError(f"预取 getFile: {js.get('error_code')} {js.get('description')}")
+        fp = js["result"]["file_path"]
+        self._path_cache[file_id] = (fp, now + self._path_cache_ttl)
+        _log(f"getFile 预取成功: file_id={file_id} path={fp} 耗时={time.time() - t0:.3f}s")
+        return fp
+
+    def prefetch_paths(self, items):
+        """并发预取多个分片的 file_path，消除后续分片的 getFile 串行等待。
+
+        ``items``: [(file_id, slot_idx), ...]
+
+        真实环境里一次 getFile 可能要 2~4s（自建代理 RTT），多分片文件串行下载时
+        每个分片都要干等一次 getFile，首次播放的等待会被成倍放大。这里在**首片下载
+        的同时**后台并发把其余分片的 file_path 取回，等轮到它们时缓存已热，
+        getFile 的 RTT 被完全隐藏在首片下载时间里。
+
+        刻意不使用连接池（走 _get_file_path_direct），避免与下载线程争用 keep-alive 连接。
+        任何一片预取失败都不影响主流程（下载时会自动回退到常规 getFile）。
+        """
+        if not items:
+            return
+        n_slots = len(self.slots) or 1
+
+        def _one(it):
+            fid, slot = it
+            idx = slot % n_slots
+            try:
+                sd = self.slots[idx]
+                cands = self._candidates.get(idx) or [(self.api_base, self.proxy_token)]
+                api_base, ptok = cands[0]
+                self._get_file_path_direct(fid, sd["token"], api_base, ptok)
+            except Exception as e:
+                _log(f"预取 file_path 失败(忽略,下载时会自动重试): "
+                     f"file_id={fid} err={type(e).__name__}: {e}")
+
+        t0 = time.time()
+        _log(f"file_path 预取开始: 分片数={len(items)}")
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, min(8, len(items)))
+        ) as ex:
+            list(ex.map(_one, items))
+        _log(f"file_path 预取完成: 分片数={len(items)} 耗时={time.time() - t0:.3f}s")
 
     def iter_chunk(self, file_id, slot, start=None, end=None, blk=None):
         """生成器：按 Range 取回单块字节。start/end 为相对该块的字节区间（含端点）。

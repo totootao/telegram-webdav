@@ -925,6 +925,22 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         # 每分片时间线：用于诊断"分片间是否卡顿"。理想情况下相邻分片间隔≈0。
         tl = []  # (ci, 下载耗时, 写回耗时, 分片间隔, 字节数)
         last_done = time.time()  # 上一片处理完（写回客户端）的时刻
+
+        # 真实环境优化：首片开始下载的同时，后台并发预取其余分片的 file_path。
+        # 一次 getFile 可能要 2~4s（自建代理 RTT），串行下载时每片都要干等一次；
+        # 预取把这段 RTT 完全藏进首片的下载时间里，轮到后续分片时缓存已热。
+        # 失败也不影响——iter_chunk 内部会自动回退到常规 getFile。
+        pf = None
+        if rest and hasattr(self.app.backend, "prefetch_paths"):
+            try:
+                pf = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                pf_fut = pf.submit(
+                    self.app.backend.prefetch_paths,
+                    [(c["file_id"], c.get("slot", 0)) for _, c, _, _, _, _, _ in rest],
+                )
+            except Exception:
+                pf = None
+
         try:
             # 首片：始终流式转发（边下边发，让客户端尽快拿到首字节）
             t_dl = time.time()
@@ -937,6 +953,14 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                  f"吞吐={_fmt_speed_local(n_first, dl_t)} "
                  f"首字节延迟={(tfb - t_dl):.3f}s(本片内) TTFB={(tfb - t0):.3f}s(自请求起)")
             last_done = time.time()
+            # 首片已开始下发，此时其余分片的 file_path 应已预取完（通常远快于首片下载）
+            if pf is not None:
+                try:
+                    pf_fut.result(timeout=120)
+                except Exception as e:
+                    _log(f"file_path 预取异常(忽略): {type(e).__name__}: {e}")
+                finally:
+                    pf.shutdown(wait=False)
             # 其余分片：默认同样流式下发（播放丝滑的关键）；
             # 仅在 TG_STREAM_ALL_CHUNKS=off 时退回「整片缓冲后一次性写出」的旧行为。
             for entry in rest:
