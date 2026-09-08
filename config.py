@@ -3,9 +3,13 @@
 参考 otterhub-server 的 .env.example：
   - TG_BOT_TOKEN / TG_CHAT_ID          单 bot 模式（频道/群组 chat_id，可为 @channel 或 -100xxxx）
   - TG_BOT_POOLS                       多 bot 池（JSON 数组：[{"token","chatId",
-                                        "apiBase"(可选),"proxyToken"(可选)}]），分摊 1 msg/s 流控
+                                        "apiBase"(可选,字符串或数组),"proxyToken"(可选,字符串或数组)}]），分摊 1 msg/s 流控
   - TG_API_BASE                        自建 Telegram API 代理基址（国内/被墙环境），可选；
                                         作为 TG_BOT_POOLS 各槽位缺省 apiBase 的全局回退
+  - TG_PROXY_POOLS                     全局代理候选池（所有 bot 共享），JSON 数组：
+                                        ["https://p1/tg","https://p2/tg"] 或
+                                        [{"apiBase":"https://p1/tg","proxyToken":"t1"},...]；
+                                        请求级轮询分摊 + 失败自动切换（多个 TG 代理）
   - TG_PROXY_TOKEN                     自建代理的鉴权令牌，作为各槽位缺省 proxyToken 的全局回退；可选
   - CHUNK_SIZE_MB                      分片大小，默认 20（Telegram Bot API 官方上传上限 20MB / 50MB）
   - DAV_USER / DAV_PASSWORD            WebDAV Basic 认证
@@ -64,16 +68,27 @@ def _load_pools():
                     chat_id = str(it.get("chatId") or it.get("chat_id") or "").strip()
                     if token and chat_id:
                         slot = {"token": token, "chat_id": chat_id}
-                        api_base = str(
-                            it.get("apiBase") or it.get("api_base") or ""
-                        ).strip()
+                        # apiBase 支持字符串或数组（多个代理）；proxyToken 同理
+                        api_base = it.get("apiBase") or it.get("api_base")
                         if api_base:
-                            slot["api_base"] = api_base.rstrip("/")
-                        proxy_token = str(
-                            it.get("proxyToken") or it.get("proxy_token") or ""
-                        ).strip()
+                            if isinstance(api_base, str):
+                                ab = api_base.strip()
+                                if ab:
+                                    slot["api_base"] = ab.rstrip("/")
+                            elif isinstance(api_base, list):
+                                lst = [str(x).strip().rstrip("/") for x in api_base if str(x).strip()]
+                                if lst:
+                                    slot["api_base"] = lst
+                        proxy_token = it.get("proxyToken") or it.get("proxy_token")
                         if proxy_token:
-                            slot["proxy_token"] = proxy_token
+                            if isinstance(proxy_token, str):
+                                pt = proxy_token.strip()
+                                if pt:
+                                    slot["proxy_token"] = pt
+                            elif isinstance(proxy_token, list):
+                                lst = [str(x).strip() for x in proxy_token if str(x).strip()]
+                                if lst:
+                                    slot["proxy_token"] = lst
                         pools.append(slot)
         except Exception:
             # 简化格式：token|chatId,token|chatId（不支持 per-slot 的 apiBase/proxyToken）
@@ -92,6 +107,38 @@ def _load_pools():
     return pools
 
 
+def _load_proxy_pools(proxy_token):
+    """解析全局 TG_PROXY_POOLS（所有 bot 共享的代理候选池）。
+
+    支持两种写法：
+      - 字符串数组: ["https://p1/tg","https://p2/tg"]（各代理共用全局 TG_PROXY_TOKEN）
+      - 对象数组: [{"apiBase":"https://p1/tg","proxyToken":"t1"}, ...]
+    返回 [(api_base, proxy_token), ...]，与每 bot 自带的 apiBase 合并成该 bot 的候选代理列表。
+
+    请求级轮询分摊 + 失败自动切换：某代理报错/超时则跳到下一个，实现「多个 TG 代理」的
+    负载均衡与容灾。
+    """
+    raw = os.environ.get("TG_PROXY_POOLS")
+    out = []
+    if not raw or not raw.strip():
+        return out
+    try:
+        arr = json.loads(raw)
+    except Exception:
+        return out
+    if not isinstance(arr, list):
+        return out
+    for it in arr:
+        if isinstance(it, dict):
+            b = str(it.get("apiBase") or it.get("api_base") or "").strip()
+            t = str(it.get("proxyToken") or it.get("proxy_token") or "").strip()
+            if b:
+                out.append((b.rstrip("/"), t or proxy_token))
+        elif isinstance(it, str) and it.strip():
+            out.append((it.strip().rstrip("/"), proxy_token))
+    return out
+
+
 class Config:
     def __init__(self):
         self.db_path = os.environ.get("DB_PATH", "./telegram_webdav.db")
@@ -105,6 +152,7 @@ class Config:
         # 同样作为 TG_BOT_POOLS 各槽位未单独指定 proxyToken 时的回退。
         self.proxy_token = (os.environ.get("TG_PROXY_TOKEN") or "").strip()
         self.slots = _load_pools()
+        self.proxy_pools = _load_proxy_pools(self.proxy_token)
         self.auth_user = os.environ.get("DAV_USER")
         self.auth_password = os.environ.get("DAV_PASSWORD")
         self.host = os.environ.get("HOST", "0.0.0.0")
@@ -129,6 +177,25 @@ class Config:
         self.body_timeout = float(os.environ.get("DAV_BODY_TIMEOUT", "300"))
         # keep-alive 空闲等待上限（秒）：超过则关闭空闲连接回收线程。
         self.idle_timeout = float(os.environ.get("DAV_IDLE_TIMEOUT", "30"))
+        # 并发度（0=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限）：
+        #   TG_UPLOAD_CONCURRENCY   上传分片并发线程数
+        #   TG_DOWNLOAD_CONCURRENCY 下载分片并发线程数（额外硬性上限 _MAX_DOWNLOAD_WORKERS 防内存爆）
+        self.upload_concurrency = int(os.environ.get("TG_UPLOAD_CONCURRENCY") or 0) or 0
+        self.download_concurrency = int(os.environ.get("TG_DOWNLOAD_CONCURRENCY") or 0) or 0
+
+    # 下载并发的硬性安全上限：避免分片过大 × 并发过多把内存吃光
+    _MAX_DOWNLOAD_WORKERS = 8
+
+    def _upload_workers(self, n_slots):
+        if self.upload_concurrency > 0:
+            return self.upload_concurrency
+        return max(1, n_slots)
+
+    def _download_workers(self, n_chunks):
+        auto = max(1, min(n_chunks, len(self.slots), self._MAX_DOWNLOAD_WORKERS))
+        if self.download_concurrency > 0:
+            return max(1, min(self.download_concurrency, n_chunks, self._MAX_DOWNLOAD_WORKERS))
+        return auto
 
     @property
     def auth_enabled(self):
@@ -141,6 +208,11 @@ class Config:
             "api_base": self.api_base,
             "proxy_auth": "on" if self.proxy_token else "off",
             "bot_slots": len(self.slots),
+            "proxy_pools": len(self.proxy_pools),
+            "upload_concurrency": self.upload_concurrency or max(1, len(self.slots)),
+            "download_concurrency": self.download_concurrency or max(
+                1, min(len(self.slots), self._MAX_DOWNLOAD_WORKERS)
+            ),
             "auth": "on" if self.auth_enabled else "off",
             "import_dir": self.import_dir,
             "rate_limit_s": self.rate_limit,

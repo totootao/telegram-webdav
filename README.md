@@ -158,9 +158,10 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | --- | --- | --- |
 | `TG_BOT_TOKEN` | bot token（单 bot 模式） | 空 |
 | `TG_CHAT_ID` | 频道/群组 chat_id（单 bot 模式） | 空 |
-| `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId","apiBase"(可选),"proxyToken"(可选)}]`；分摊 1 msg/s 流控。`apiBase`/`proxyToken` 缺省时回退全局变量 | 空 |
+| `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId","apiBase"(可选,字符串或数组),"proxyToken"(可选,字符串或数组)}]`；分摊 1 msg/s 流控。`apiBase`/`proxyToken` 缺省时回退全局变量；`apiBase` 写成数组即「该 bot 走多个 TG 代理」 | 空 |
 | `TG_API_BASE` | 全局 Telegram API 代理基址（国内/被墙用），作为各 bot 未单独指定 `apiBase` 时的默认回退 | `https://api.telegram.org` |
 | `TG_PROXY_TOKEN` | 全局代理鉴权令牌，以 `Authorization: Bearer` 头发出，作为各 bot 未单独指定 `proxyToken` 时的默认回退；官方 API 场景留空 | 空 |
+| `TG_PROXY_POOLS` | 全局代理候选池（所有 bot 共享），JSON 数组：字符串数组 `["https://p1/tg","https://p2/tg"]` 或对象数组 `[{"apiBase":"https://p1/tg","proxyToken":"t1"},...]`；与每 bot 自带 `apiBase` 合并成候选列表，请求级轮询分摊 + 失败自动切换（多个 TG 代理的负载均衡与容灾） | 空 |
 | `CHUNK_SIZE_MB` | 分片大小（≤20 即可走官方 Bot API；自建 Bot API Server 可到 2000） | `20` |
 | `DB_PATH` | SQLite 文件路径 | `./telegram_webdav.db` |
 | `DAV_USER` / `DAV_PASSWORD` | Basic 认证（建议必填） | 空（关闭认证） |
@@ -169,6 +170,8 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `WEBDAV_IMPORT_DIR` | webhook 入库落盘目录 | `/telegram-import` |
 | `TG_RATE_LIMIT` | 每 bot 发送最小间隔（秒），防 429 | `1.0` |
 | `TG_SLOT_ROTATE` | 多 bot 池分片是否轮转分摊（`on`=各频道均匀承载；`off`=固定优先第一个，即主备模式） | `on` |
+| `TG_UPLOAD_CONCURRENCY` | 上传分片并发线程数（`0`=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限） | `0`（=bot 数） |
+| `TG_DOWNLOAD_CONCURRENCY` | 下载分片并发线程数（`0`=自动，取 `min(分片数, bot 数)`，硬性上限 8 防内存爆） | `0`（=min(分片数,bot数,8)） |
 | `DAV_ROOT` | 把 WebDAV 根挂载到某子路径（默认 `/`），如 `/dav`；href 会自动带此前缀 | `/` |
 | `DAV_KEEPALIVE` | 是否复用 TCP 连接（`on`/`off`）；个别客户端请求体长度数错导致错位时设 `off` | `on` |
 | `DAV_BODY_TIMEOUT` | 请求体读取超时（秒），防止 `Content-Length` 虚高把线程拖死 | `300` |

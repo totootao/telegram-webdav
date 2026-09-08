@@ -25,6 +25,7 @@
      Content-Length 虚高时不会把线程拖死。
 """
 import base64
+import concurrent.futures
 import email.utils
 import hashlib
 import json
@@ -626,6 +627,49 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         self._serve_file(head_only=True)
 
+    # ---------------- 并发上传 / 下载 ----------------
+    def _upload_parallel(self, body_data, orig_name, multi, chunk_size, chunks_meta,
+                         file_hash, head_sample_size, tail_sample_size):
+        """并发上传所有分片到 Telegram：线程池切片上传，保序收集。
+
+        - 并发数 = config._upload_workers(槽位数)（默认=bot 数，受每 bot 1 msg/s 限流约束）
+        - 每分片独立算 SHA-256 供下载校验；整文件 SHA-256 按序组装
+        - 任一分片失败即取消其余任务并抛出，由调用方回 502
+        """
+        total = len(body_data)
+        n_chunks = (total + chunk_size - 1) // chunk_size
+        workers = self.app.config._upload_workers(len(self.app.backend.slots))
+        _log(f"PUT 并发上传启动: 分片数={n_chunks} 并发线程={workers}")
+
+        def _one(ci, buf):
+            chunk_sha = hashlib.sha256(buf).hexdigest()
+            chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
+            fid, slot, mid = self.app.backend.upload_chunk(buf, file_name=chunk_name)
+            return ci, fid, slot, mid, chunk_sha, buf
+
+        results = [None] * n_chunks
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            fut_map = {
+                ex.submit(_one, i, body_data[i * chunk_size:(i + 1) * chunk_size]): i
+                for i in range(n_chunks)
+            }
+            for fut in concurrent.futures.as_completed(fut_map):
+                i = fut_map[fut]
+                try:
+                    results[i] = fut.result()
+                except _tg.TGError as e:
+                    for f2 in fut_map.values():
+                        f2.cancel()
+                    raise
+        # 按序组装：整文件哈希 + 分片元信息（带 _buf 供调用方取 head/tail 采样，落库前清除）
+        for res in results:
+            _, fid, slot, mid, chunk_sha, buf = res
+            file_hash.update(buf)
+            chunks_meta.append({
+                "file_id": fid, "slot": slot, "size": len(buf),
+                "message_id": mid, "sha256": chunk_sha, "_buf": buf,
+            })
+
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
         if path is None:
@@ -692,41 +736,57 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if total == 0 or not chunks:
             return
 
+        # 预先规划本次需要拉取的分片及其相对 [start,end] 的字节区间
         offset = 0
+        plan = []  # (ci, c, cstart, cend, rs, re_, verify)
+        for ci, c in enumerate(chunks):
+            csize = c["size"]
+            cstart = offset
+            cend = offset + csize - 1
+            offset += csize
+            # 只有「完整落在请求区间内」的分片才能校验整片哈希；
+            # Range 把分片切开的情形只流式转发、不校验（无完整分片可比对）。
+            csha = c.get("sha256")
+            verify = csha is not None and cstart >= start and cend <= end
+            if cend < start or cstart > end:
+                continue
+            rs = max(cstart, start) - cstart
+            re_ = min(cend, end) - cstart
+            plan.append((ci, c, cstart, cend, rs, re_, verify))
+        if not plan:
+            return
+
+        workers = self.app.config._download_workers(len(plan))
+        _log(f"GET 并发下载启动: path={path} 需拉分片={len(plan)} 并发线程={workers} "
+             f"Range={self.headers.get('Range')}")
+
+        # 并发拉取各分片（完整片段），主线程按字节序回写（保序流式，内存只保留窗口内分片）
+        def _fetch(ci, c, rs, re_):
+            data = b"".join(self.app.backend.iter_chunk(
+                c["file_id"], c.get("slot", 0), rs, re_
+            ))
+            return ci, data
+
+        fut_by_ci = {}
         try:
-            for c in chunks:
-                csize = c["size"]
-                cstart = offset
-                cend = offset + csize - 1
-                offset += csize
-                # 只有「完整落在请求区间内」的分片才能校验整片哈希；
-                # Range 把分片切开的情形只流式转发、不校验（无完整分片可比对）。
-                csha = c.get("sha256")
-                verify = csha is not None and cstart >= start and cend <= end
-                hctx = hashlib.sha256() if verify else None
-                got = 0
-                if cend < start or cstart > end:
-                    continue
-                rs = max(cstart, start) - cstart
-                re_ = min(cend, end) - cstart
-                for block in self.app.backend.iter_chunk(
-                    c["file_id"], c.get("slot", 0), rs, re_
-                ):
-                    if not block:
-                        break
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                for ci, c, _, _, rs, re_, _ in plan:
+                    fut_by_ci[ci] = ex.submit(_fetch, ci, c, rs, re_)
+                # 按字节序逐片等待 → 校验 → 回写（前面的分片已写出即可释放内存）
+                for ci, c, cstart, cend, rs, re_, verify in plan:
                     try:
-                        self.wfile.write(block)
+                        _, data = fut_by_ci[ci].result()
+                    except _tg.TGError as e:
+                        for f in fut_by_ci.values():
+                            f.cancel()
+                        raise
+                    if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
+                        raise _IntegrityError(cstart)
+                    try:
+                        self.wfile.write(data)
                     except (ConnectionError, OSError):
                         # 客户端中途断开，静默结束
                         return
-                    if hctx is not None:
-                        hctx.update(block)
-                        got += len(block)
-                if hctx is not None and got != csize:
-                    # 流式截断/长度对不上：即便哈希没算完也视为损坏
-                    raise _IntegrityError(cstart)
-                if hctx is not None and hctx.hexdigest() != csha:
-                    raise _IntegrityError(cstart)
         except _IntegrityError as e:
             # 分片内容与上传时记录的不一致（Telegram 返回了损坏/截断的字节，或数据被污染）：
             # 已经可能发了一部分脏数据，立刻中断连接，绝不把错数据当完整文件交给客户端。
@@ -840,35 +900,22 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         file_hash = hashlib.sha256()  # 整文件 SHA-256：边读边算，零额外内存
         head_sample = b""  # 首片头部采样（解析媒体时长用）
         tail_sample = b""  # 末片尾部采样
+        n_chunks = (total + chunk_size - 1) // chunk_size if total > 0 else 0
         try:
-            # 将完整请求体按 chunk_size 切片上传到 Telegram
-            offset = 0
-            while offset < total:
-                want = min(chunk_size, total - offset)
-                buf = body_data[offset:offset + want]
-                if ci == 0:
-                    head_sample = buf[:_MEDIA_HEAD_SAMPLE]
-                file_hash.update(buf)
-                # 每分片也单独算 SHA-256，供下载时逐片流式校验（姿势 A：边发边验、零缓冲）
-                chunk_sha = hashlib.sha256(buf).hexdigest()
-                chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
-                fid, slot, mid = self.app.backend.upload_chunk(
-                    buf, file_name=chunk_name
-                )
-                chunks_meta.append(
-                    {"file_id": fid, "slot": slot, "size": len(buf),
-                     "message_id": mid, "sha256": chunk_sha}
-                )
-                offset += len(buf)
-                if offset >= total:
-                    tail_sample = buf[-_MEDIA_TAIL_SAMPLE:]
-                ci += 1
+            if total > 0:
+                self._upload_parallel(body_data, orig_name, multi, chunk_size,
+                                       chunks_meta, file_hash, _MEDIA_HEAD_SAMPLE,
+                                       _MEDIA_TAIL_SAMPLE)
+                head_sample = chunks_meta[0]["_buf"][:_MEDIA_HEAD_SAMPLE] if chunks_meta else b""
+                tail_sample = chunks_meta[-1]["_buf"][-_MEDIA_TAIL_SAMPLE:] if chunks_meta else b""
+                for c in chunks_meta:
+                    c.pop("_buf", None)  # 元信息落库前清掉内存引用
             # 清理残留字节（AList 类 CL 少算），必要时关闭连接
             self._drain_residual()
-            _log(f"PUT 分片上传完成: path={path} 分片数={ci} 总大小={total}B "
-                 f"chunk_size={chunk_size}B")
+            _log(f"PUT 分片上传完成(并发={self.app.config._upload_workers(len(self.app.backend.slots))}): "
+                 f"path={path} 分片数={n_chunks} 总大小={total}B chunk_size={chunk_size}B")
         except _tg.TGError as e:
-            _log(f"PUT 上传到 Telegram 失败(返回502): path={path} 已上传分片={ci}/{ci} "
+            _log(f"PUT 上传到 Telegram 失败(返回502): path={path} 已上传分片={len(chunks_meta)}/{n_chunks} "
                  f"total={total}B 错误={e}")
             self._send(502, {"Content-Type": "text/plain; charset=utf-8"},
                        f"上传到 Telegram 失败: {e}".encode("utf-8"))
@@ -1146,6 +1193,7 @@ class App:
             _tg.TelegramBackend(
                 self.config.slots, self.config.api_base, self.config.rate_limit,
                 self.config.proxy_token, self.config.slot_rotate,
+                self.config.proxy_pools,
             )
             if self.config.slots
             else None
