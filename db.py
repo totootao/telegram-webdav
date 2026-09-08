@@ -7,12 +7,17 @@
 nodes 表即一个虚拟文件系统：
   - 目录：is_dir=1，size=0，chunks=NULL
   - 文件：is_dir=0，size=字节数，chunks=JSON 数组
-        [{ "file_id": "...", "slot": 0, "size": 20971520, "message_id": 123 },
-         { "file_id": "...", "slot": 1, "size": 12345,    "message_id": 124 }]
+        [{ "file_id": "...", "slot": 0, "size": 20971520, "message_id": 123 }, ...]
     slot 记录上传该分片所用的 bot 序号（file_id 与 bot 绑定，下载时须用同 bot token）。
 
-并发：HTTP/1.1 多线程服务器下，每条请求独立连接 + 全局写锁 + WAL，避免 "database is locked"。
+并发模型（与多连接 WAL 模型对比，刻意改用单连接）：
+  HTTP/1.1 多线程服务器下，每条请求在独立线程。早期版本每条请求开/关一个 SQLite 连接
+  走 WAL，但在某些环境/SQLite 构建里会出现写事务长时间拿不到写锁、commit 被活锁拖死
+  （busy_timeout 也不生效）的现象。这里改为：**整个进程共享一条连接**
+  （`check_same_thread=False`），所有读写都包在同一把 `threading.Lock` 下串行化。
+  这样既消除了多连接之间的锁互相等待，又把锁的语义收拢到 Python 层，行为确定、可预期。
 """
+
 import json
 import os
 import sqlite3
@@ -28,21 +33,27 @@ class MetaStore:
         d = os.path.dirname(os.path.abspath(path))
         if d and not os.path.isdir(d):
             os.makedirs(d, exist_ok=True)
+        self._conn = self._open()
         self._init_db()
 
-    # ---------- 连接 ----------
-    def _conn(self):
-        conn = sqlite3.connect(self.path, timeout=30)
+    # ---------- 连接（单例，线程安全由 self._lock 保证） ----------
+    def _open(self):
+        conn = sqlite3.connect(self.path, timeout=60, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA busy_timeout=60000")
         conn.execute("PRAGMA synchronous=NORMAL")
         return conn
 
+    def close(self):
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
     def _init_db(self):
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS nodes (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -59,8 +70,8 @@ class MetaStore:
                 )
                 """
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path)")
-            conn.execute(
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_nodes_path ON nodes(path)")
+            self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS locks (
                     token   TEXT PRIMARY KEY,
@@ -72,31 +83,24 @@ class MetaStore:
                 """
             )
             now = int(time.time())
-            conn.execute(
+            self._conn.execute(
                 "INSERT OR IGNORE INTO nodes(path,name,is_dir,size,mtime,ctime,etag) "
                 "VALUES('/','',1,0,?,?,?)",
                 (now, now, '"root"'),
             )
-            conn.commit()
-            conn.close()
+            self._conn.commit()
 
     # ---------- 基础读写 ----------
     def get_node(self, path):
-        conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM nodes WHERE path=?", (path,)).fetchone()
+        with self._lock:
+            cur = self._conn.execute("SELECT * FROM nodes WHERE path=?", (path,))
+            row = cur.fetchone()
             return dict(row) if row else None
-        finally:
-            conn.close()
-
-    def _row_to_dict(self, row):
-        return dict(row)
 
     def list_children(self, path, depth="1"):
         """返回 (自身, [子节点...])。depth: 0/1/infinity。"""
-        conn = self._conn()
-        try:
-            self_node = conn.execute(
+        with self._lock:
+            self_node = self._conn.execute(
                 "SELECT * FROM nodes WHERE path=?", (path,)
             ).fetchone()
             if self_node is None:
@@ -105,7 +109,7 @@ class MetaStore:
             if depth == "0":
                 return self_node, []
             prefix = "/" if path == "/" else path + "/"
-            rows = conn.execute(
+            rows = self._conn.execute(
                 "SELECT * FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\' ORDER BY path",
                 (path, prefix + "%"),
             ).fetchall()
@@ -120,23 +124,17 @@ class MetaStore:
                     if "/" not in rel:
                         out.append(n)
                 return self_node, out
-            # infinity
             return self_node, [n for n in nodes if n["path"] != path]
-        finally:
-            conn.close()
 
     def descendants(self, path):
         """返回 path 及其所有后代（含自身）。"""
-        conn = self._conn()
-        try:
+        with self._lock:
             prefix = "/" if path == "/" else path + "/"
-            rows = conn.execute(
+            rows = self._conn.execute(
                 "SELECT * FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\' ORDER BY path",
                 (path, prefix + "%"),
             ).fetchall()
             return [dict(r) for r in rows]
-        finally:
-            conn.close()
 
     # ---------- 创建 ----------
     def create_file(self, path, content_type, chunks, size, chunk_size=None, mtime=None):
@@ -145,8 +143,7 @@ class MetaStore:
         etag = '"' + uuid.uuid4().hex + '"'
         chunks_json = json.dumps(chunks, ensure_ascii=False) if chunks is not None else None
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._conn.execute(
                 "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,chunk_size,chunks) "
                 "VALUES(?,?,0,?,?,?,?,?,?,?) "
                 "ON CONFLICT(path) DO UPDATE SET name=excluded.name, size=excluded.size, "
@@ -155,8 +152,7 @@ class MetaStore:
                 (path, name, size, content_type, etag, mtime or now, now,
                  chunk_size, chunks_json, mtime or now),
             )
-            conn.commit()
-            conn.close()
+            self._conn.commit()
         return etag
 
     def create_dir(self, path, mtime=None):
@@ -164,40 +160,31 @@ class MetaStore:
         name = path.rstrip("/").split("/")[-1]
         etag = '"' + uuid.uuid4().hex + '"'
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._conn.execute(
                 "INSERT INTO nodes(path,name,is_dir,size,etag,mtime,ctime) "
                 "VALUES(?,?,1,0,?,?,?) "
                 "ON CONFLICT(path) DO UPDATE SET mtime=?, etag=excluded.etag",
                 (path, name, etag, mtime or now, now, mtime or now),
             )
-            conn.commit()
-            conn.close()
+            self._conn.commit()
         return etag
 
     def set_mtime(self, path, mtime=None):
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._conn.execute(
                 "UPDATE nodes SET mtime=? WHERE path=?", (mtime or int(time.time()), path)
             )
-            conn.commit()
-            conn.close()
+            self._conn.commit()
 
     # ---------- 删除 ----------
     def delete_recursive(self, path):
         with self._lock:
-            conn = self._conn()
             prefix = "/" if path == "/" else path + "/"
-            conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                         (path, prefix + "%"))
-            conn.commit()
-            conn.close()
+            self._conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                               (path, prefix + "%"))
+            self._conn.commit()
 
     # ---------- 移动 / 复制 ----------
-    def _canonical(self, p):
-        return p
-
     def move(self, src, dst):
         """移动子树 src -> dst（覆盖已存在的 dst）。src 不能为 dst 的祖先。"""
         if dst == src or dst.startswith(src + "/"):
@@ -206,15 +193,13 @@ class MetaStore:
         if not nodes:
             return False
         with self._lock:
-            conn = self._conn()
-            # 先删目标（含后代）
             dprefix = "/" if dst == "/" else dst + "/"
-            conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                         (dst, dprefix + "%"))
+            self._conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                              (dst, dprefix + "%"))
             for n in nodes:
                 old = n["path"]
                 new = dst if old == src else dst + old[len(src):]
-                conn.execute(
+                self._conn.execute(
                     "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,chunk_size,chunks) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET name=excluded.name, is_dir=excluded.is_dir, "
@@ -223,12 +208,10 @@ class MetaStore:
                     (new, n["name"], n["is_dir"], n["size"], n["content_type"], n["etag"],
                      int(time.time()), n["ctime"], n["chunk_size"], n["chunks"], int(time.time())),
                 )
-            # 删除源子树（移动 = 复制 + 删除源）
             sprefix = "/" if src == "/" else src + "/"
-            conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                         (src, sprefix + "%"))
-            conn.commit()
-            conn.close()
+            self._conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                               (src, sprefix + "%"))
+            self._conn.commit()
         return True
 
     def copy(self, src, dst):
@@ -239,14 +222,13 @@ class MetaStore:
         if not nodes:
             return False
         with self._lock:
-            conn = self._conn()
             dprefix = "/" if dst == "/" else dst + "/"
-            conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
-                         (dst, dprefix + "%"))
+            self._conn.execute("DELETE FROM nodes WHERE path=? OR path LIKE ? ESCAPE '\\'",
+                               (dst, dprefix + "%"))
             for n in nodes:
                 old = n["path"]
                 new = dst if old == src else dst + old[len(src):]
-                conn.execute(
+                self._conn.execute(
                     "INSERT INTO nodes(path,name,is_dir,size,content_type,etag,mtime,ctime,chunk_size,chunks) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(path) DO UPDATE SET name=excluded.name, is_dir=excluded.is_dir, "
@@ -255,42 +237,32 @@ class MetaStore:
                     (new, n["name"], n["is_dir"], n["size"], n["content_type"], n["etag"],
                      n["mtime"], n["ctime"], n["chunk_size"], n["chunks"], n["mtime"]),
                 )
-            conn.commit()
-            conn.close()
+            self._conn.commit()
         return True
 
     # ---------- 锁 ----------
     def add_lock(self, token, path, owner, depth, ttl):
         expiry = int(time.time()) + ttl
         with self._lock:
-            conn = self._conn()
-            conn.execute(
+            self._conn.execute(
                 "INSERT INTO locks(token,path,owner,depth,expiry) VALUES(?,?,?,?,?) "
                 "ON CONFLICT(token) DO UPDATE SET path=excluded.path, owner=excluded.owner, "
                 "depth=excluded.depth, expiry=excluded.expiry",
                 (token, path, owner, depth, expiry),
             )
-            conn.commit()
-            conn.close()
+            self._conn.commit()
 
     def get_lock(self, token):
-        conn = self._conn()
-        try:
-            row = conn.execute("SELECT * FROM locks WHERE token=?", (token,)).fetchone()
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM locks WHERE token=?", (token,)).fetchone()
             return dict(row) if row else None
-        finally:
-            conn.close()
 
     def remove_lock(self, token):
         with self._lock:
-            conn = self._conn()
-            conn.execute("DELETE FROM locks WHERE token=?", (token,))
-            conn.commit()
-            conn.close()
+            self._conn.execute("DELETE FROM locks WHERE token=?", (token,))
+            self._conn.commit()
 
     def purge_expired_locks(self):
         with self._lock:
-            conn = self._conn()
-            conn.execute("DELETE FROM locks WHERE expiry < ?", (int(time.time()),))
-            conn.commit()
-            conn.close()
+            self._conn.execute("DELETE FROM locks WHERE expiry < ?", (int(time.time()),))
+            self._conn.commit()

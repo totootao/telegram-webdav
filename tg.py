@@ -34,6 +34,25 @@ def _mp_boundary():
     return "----tgwebdav" + uuid.uuid4().hex
 
 
+def _safe_filename(name):
+    """把任意路径清洗成可安全放进 multipart ``filename`` 的字节。
+
+    - 取 basename（去掉父目录）；
+    - 去掉会破坏 Content-Disposition 头/多部分边界的字符（引号、回车、换行、NUL）；
+    - 超长截断到 200 字符（Telegram 对文件名长度没有硬限制，但过长是无意义的负担）；
+    - 兜底为 ``part.bin``，保证永远有名字。
+    """
+    if not name:
+        return "part.bin"
+    base = name.replace("\\", "/").rsplit("/", 1)[-1]
+    cleaned = "".join(ch for ch in base if ch not in '"\r\n\x00').strip()
+    if not cleaned:
+        return "part.bin"
+    if len(cleaned) > 200:
+        cleaned = cleaned[:200]
+    return cleaned
+
+
 def _build_multipart(boundary, fields, files):
     """构造 multipart/form-data 请求体。fields=[(name,value)], files=[(name,fname,ctype,data)]。"""
     if isinstance(boundary, str):
@@ -97,8 +116,14 @@ class TelegramBackend:
             self._last[idx] = time.time()
 
     # ---------- 上传 ----------
-    def upload_chunk(self, data, prefer_slot=None):
-        """上传一块二进制到 Telegram，返回 (file_id, slot_index, message_id)。失败时抛 TGError。"""
+    def upload_chunk(self, data, prefer_slot=None, file_name=None):
+        """上传一块二进制到 Telegram，返回 (file_id, slot_index, message_id)。失败时抛 TGError。
+
+        ``file_name`` 是「原始文件名」（webdav 层传进来的 basename，多分片时带 .partNN
+        后缀）。它会作为 sendDocument 的 ``filename`` 写进频道消息——这样在 Telegram
+        里浏览频道时看到的就是原文件名，而不是千篇一律的 ``part.bin``（参考 otterhub-server
+        的 dav_gateway 把 ``file_name`` 一路透传到后端）。
+        """
         if not self.slots:
             raise TGError("Telegram 未配置（设置 TG_BOT_TOKEN/TG_CHAT_ID 或 TG_BOT_POOLS）")
         n = len(self.slots)
@@ -106,13 +131,14 @@ class TelegramBackend:
         tried = set()
         idx = start
         last_err = None
+        fname = _safe_filename(file_name)
         # 在槽位间轮转（参考 tg-pool：429 换槽不消耗重试次数）
         for _ in range(n):
             tried.add(idx)
             slot = self.slots[idx]
             self._rate_wait(idx)
             try:
-                fid, mid = self._send_document(slot, data)
+                fid, mid = self._send_document(slot, data, fname)
                 return fid, idx, mid
             except TGError as e:
                 last_err = e
@@ -130,12 +156,12 @@ class TelegramBackend:
                 continue
         raise TGError("分片上传失败: " + (str(last_err) if last_err else "未知错误"))
 
-    def _send_document(self, slot, data, retries=3):
+    def _send_document(self, slot, data, file_name="part.bin", retries=3):
         boundary = _mp_boundary()
         body = _build_multipart(
             boundary,
             [("chat_id", slot["chat_id"]), ("disable_content_type_detection", "true")],
-            [("document", "part.bin", "application/octet-stream", data)],
+            [("document", file_name, "application/octet-stream", data)],
         )
         url = self._api_url(slot["token"], "sendDocument")
         req = urllib.request.Request(url, data=body, method="POST")

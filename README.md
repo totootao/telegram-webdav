@@ -89,7 +89,10 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_WEBHOOK_SECRET` | 频道入库 webhook 密钥（Telegram 以 `X-Telegram-Bot-Api-Secret-Token` 头发送） | 空 |
 | `WEBDAV_IMPORT_DIR` | webhook 入库落盘目录 | `/telegram-import` |
 | `TG_RATE_LIMIT` | 每 bot 发送最小间隔（秒），防 429 | `1.0` |
-| `DAV_ROOT` | 把 WebDAV 根挂载到某子路径（默认 `/`） | `/` |
+| `DAV_ROOT` | 把 WebDAV 根挂载到某子路径（默认 `/`），如 `/dav`；href 会自动带此前缀 | `/` |
+| `DAV_KEEPALIVE` | 是否复用 TCP 连接（`on`/`off`）；个别客户端请求体长度数错导致错位时设 `off` | `on` |
+| `DAV_BODY_TIMEOUT` | 请求体读取超时（秒），防止 `Content-Length` 虚高把线程拖死 | `300` |
+| `DAV_IDLE_TIMEOUT` | keep-alive 空闲等待上限（秒），超时即回收空闲连接；自测可设小 | `30` |
 
 ---
 
@@ -187,19 +190,34 @@ python3 selftest.py
 
 | 操作 | AList 侧表现 | 备注 |
 | --- | --- | --- |
-| 挂载后首次列目录 | 正常 | WebDav 地址必须**以 `/` 结尾**，例如 `http://ip:8080/` |
+| 挂载后首次列目录 | 正常 | 建议 WebDav 地址**以 `/` 结尾**（如 `http://ip:8080/`）；服务端现已对带/不带 `/` 都兼容 |
 | 新建文件夹（单层 / 嵌套） | 正常 | `MKCOL`，父目录不存在时按规范返回 409 |
 | 上传 / 下载文件 | 正常 | 走 `PUT` / `GET`，支持 Range |
 | 删除文件 / 文件夹 | 正常 | 服务端递归删元数据；Telegram 侧的物理分片仍留频道 |
 
-> **踩过的坑**：AList 的 WebDav 驱动构造 PROPFIND 的 XML body 时，`Content-Length`
-> 比真实 body 少算 1 字节（尾部那个 `\n` 没算进去）。在 keep-alive 下，这个残留字节
-> 会被服务端当成下一个请求的起始行，于是吐出 Python 自带的 HTML 400 页，客户端报
-> `malformed HTTP status code "HTML>"`，表现为「首次能连上、创建/删除全失败」。
+> **踩过的坑**：AList / OpenList 的 WebDav 驱动构造 PROPFIND / MKCOL / DELETE 的
+> XML body 时，`Content-Length` 比真实 body 少算 1 字节（尾部那个 `\n` 没算进去）。
+> 在 keep-alive 下，这个残留字节会被服务端当成下一个请求的起始行，于是吐出 Python
+> 自带的 HTML 400 页，客户端报 `malformed HTTP status code "HTML>"`，表现为
+> 「首次能连上、创建/删除全失败」。另一类常见坑是**挂载地址没以 `/` 结尾**，AList
+> 会拼出畸形 URL 命中网关 HTML 页。
 >
-> 本项目的处理：**每次请求结束后读净请求体并关闭连接**（响应带 `Connection: close`），
-> 从根上消除请求边界错位。代价是每个请求一次 TCP 握手，而本服务的瓶颈在 Telegram 的
-> 1 msg/s 限流，这点开销可以忽略。
+> 本项目的处理：
+> - **路径与尾斜杠**：目录无论带不带 `/` 都能访问；PROPFIND 的 href 始终对集合补 `/`
+>   （符合 RFC 4918，客户端相对路径才对）；`DAV_ROOT` 挂载时 href 自动带前缀。客户端侧
+>   挂载地址仍以 `/` 结尾最稳（如 `http://ip:8080/`）。
+> - **keep-alive 残包检测（非破坏性）**：服务每次处理完请求都读净请求体，并**非破坏性地**
+>   探测「是否还有超出 `Content-Length` 的残留字节」——用 0 超时 peek，避免把 socket 读超时
+>   变成莫名其妙的 500。探测到残留时，只要它**不像**一条新请求起始行（即确实是客户端数错长度
+>   多发的那段字节），就直接**丢弃**，连接照样复用；一旦看起来像下一条请求（流水线）就停手。
+>   没残留就放心复用连接，好客户端（rclone / Windows / macOS / cadaver）享受 keep-alive。
+> - **回退开关**：若某客户端仍报 `HTML>`，设 `DAV_KEEPALIVE=off` 退回「每条连接只
+>   服务一次」的保守模式即可，行为等价于早期版本。
+> - **频道里的文件名 = 原文件名**：`PUT` 上传时把原始文件名（URL 最后一段）透传给
+>   Telegram 的 `sendDocument` 的 `filename` 字段（参考 otterhub-server 的做法），
+>   这样在频道里浏览时看到的就是 `report.pdf` 而不是千篇一律的 `part.bin`。单分片直接用
+>   原文件名；多分片用「原文件名.partNN」既保留原名线索又能区分分片（下载仍按 `file_id`，
+>   文件名仅影响频道展示，不影响内容）。
 
 ---
 

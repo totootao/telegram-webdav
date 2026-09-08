@@ -84,6 +84,16 @@ class Config:
         self.import_dir = (os.environ.get("WEBDAV_IMPORT_DIR", "/telegram-import") or "/telegram-import").rstrip("/") or "/telegram-import"
         self.rate_limit = float(os.environ.get("TG_RATE_LIMIT", "1.0"))
         self.root_path = (os.environ.get("DAV_ROOT", "/") or "/").rstrip("/") or "/"
+        # keep-alive：默认开启（好客户端复用连接）；若某客户端仍报
+        # `malformed HTTP status code "HTML>"`，设 off 退回「每条连接只服务一次」。
+        self.keepalive = (
+            os.environ.get("DAV_KEEPALIVE", "on").strip().lower()
+            not in ("0", "off", "false", "no")
+        )
+        # 请求体读取超时（秒）：Content-Length 虚高时不会把线程拖死。
+        self.body_timeout = float(os.environ.get("DAV_BODY_TIMEOUT", "300"))
+        # keep-alive 空闲等待上限（秒）：超过则关闭空闲连接回收线程。
+        self.idle_timeout = float(os.environ.get("DAV_IDLE_TIMEOUT", "30"))
 
     @property
     def auth_enabled(self):
@@ -99,6 +109,9 @@ class Config:
             "auth": "on" if self.auth_enabled else "off",
             "import_dir": self.import_dir,
             "rate_limit_s": self.rate_limit,
+            "keepalive": "on" if self.keepalive else "off",
+            "body_timeout_s": self.body_timeout,
+            "idle_timeout_s": self.idle_timeout,
         }
 
 

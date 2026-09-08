@@ -15,6 +15,7 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 STORE = {}  # file_id -> bytes
+FILENAMES = {}  # file_id -> 上传时声明的 filename（用于验证原始文件名透传）
 _COUNTER = [0]
 _LOCK = threading.Lock()
 
@@ -88,6 +89,7 @@ class FakeTGHandler(BaseHTTPRequestHandler):
                 return
             fid = _new_id()
             STORE[fid] = f[1]
+            FILENAMES[fid] = f[0]
             self._send_json({
                 "ok": True,
                 "result": {

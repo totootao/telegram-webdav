@@ -1,21 +1,36 @@
 """WebDAV 处理器（纯标准库实现，零第三方依赖）。
 
-实现 OtterHub "频道即存储" 的纯 WebDAV 访问层：客户端用标准 WebDAV 协议
-（Windows 映射驱动器 / macOS Finder / rclone / cadaver）读写，服务端把字节
-分片塞进 Telegram 频道，把文件树存在 SQLite。
+实现 Telegram 频道即存储的纯 WebDAV 访问层：客户端用标准 WebDAV 协议
+（Windows 映射驱动器 / macOS Finder / rclone / cadaver / AList / OpenList）读写，
+服务端把字节分片塞进 Telegram 频道，把文件树存在 SQLite。
 
 支持方法：
   OPTIONS  PROPFIND  GET  HEAD  PUT  DELETE  MKCOL  MOVE  COPY  LOCK  UNLOCK  PROPPATCH
-  POST    /telegram/webhook*  频道/群消息自动入库（参考 otterhub 的 webhook 导入）
+  POST    /telegram/webhook*  频道/群消息自动入库
 
-下载支持 HTTP Range：把请求区间映射到分片，逐片向 Telegram 发 Range 请求并流式拼接
-（与 otterhub tg-adapter.getMergedFile 同思路）。
+设计目标：通用适配 + 健壮性
+  1. 路径与尾斜杠：目录无论带不带 ``/`` 都能正确访问；PROPFIND 的 href 始终
+     对集合补 ``/``（符合 RFC 4918，客户端相对路径才能算对）；``DAV_ROOT`` 挂载
+     时 href 自动带挂载前缀，客户端拿到的地址才自洽。
+  2. keep-alive 残包检测：AList/OpenList 的 WebDav 驱动给 PROPFIND/MKCOL/DELETE
+     构造的 XML body 的 Content-Length 比真实 body 少算 1 字节（尾部 ``\\n``）。
+     若沿用 keep-alive，残留字节会被当成下一个请求的起始行，服务端吐 Python 自带的
+     HTML 400 页，客户端表现为 ``malformed HTTP status code "HTML>"``。
+     这里每次处理完请求都读净请求体，并**非破坏性地**探测是否还有超出
+     Content-Length 的残留字节：确实是垃圾（不像新请求起始行）就丢掉，连接照样复用；
+     看起来像下一条请求就停手（流水线）；乱到超过上限才关连接。从根上消除边界错位。
+     仍可用 ``DAV_KEEPALIVE=off`` 退回"每条连接只服务一次"的保守模式。
+  3. 防御性：任何 handler 抛异常都回 500 并关闭连接，绝不把 Python traceback / HTML
+     漏给客户端；写响应时客户端断连（BrokenPipe）静默处理；请求体读取带超时，
+     Content-Length 虚高时不会把线程拖死。
 """
 import base64
 import email.utils
 import hashlib
 import json
 import re
+import select
+import socket
 import time
 import urllib.parse
 import xml.sax.saxutils
@@ -32,6 +47,37 @@ def _now_http(ts):
 
 def _now_iso(ts):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+# 请求体读取超时（秒）。防止 Content-Length 虚高时把线程拖死。空闲 keep-alive
+# 等待上限改为从配置读取（DAV_IDLE_TIMEOUT，默认 30），便于自测调小、生产按需放大。
+_BODY_TIMEOUT = 300.0
+# 单次最多丢掉多少个「Content-Length 之外」的垃圾字节。超过说明客户端严重错乱，
+# 直接关连接，不做无谓挣扎。
+_RESIDUAL_LIMIT = 4096
+
+# 常见 HTTP/WebDAV 方法。用于判断缓冲区开头是「一条新请求」（流水线，不能动）
+# 还是「上一条请求多出来的垃圾字节」（可以安全丢掉）。
+_HTTP_METHODS = frozenset(
+    b"""OPTIONS GET HEAD POST PUT DELETE TRACE CONNECT PATCH
+        PROPFIND PROPPATCH MKCOL COPY MOVE LOCK UNLOCK
+        ACL REPORT SEARCH MKACTIVITY BASELINE-CONTROL VERSION-CONTROL
+        BPROPFIND BPROPPATCH ORDERPATCH LABEL MKREDIRECTREF UPDATEREDIRECTREF
+        MKWORKSPACE CHECKIN CHECKOUT UNCHECKOUT MERGE""".split()
+)
+
+
+def _is_timeout_err(e):
+    """判断一个异常是不是「套接字读超时」而不是真的协议/逻辑错误。
+
+    Python 的 ``socket.timeout``（3.10+ 即内置 ``TimeoutError``）在 ``SocketIO``
+    上还会留下「已超时」标记，之后该连接上的任何读都会抛
+    ``OSError('cannot read from timed out object')``——这条消息里也带 timed out。
+    这类异常代表「空闲连接该回收了」，绝不能渲染成 500 吓客户端。
+    """
+    if isinstance(e, (TimeoutError, socket.timeout)):
+        return True
+    return isinstance(e, OSError) and "timed out" in str(e).lower()
 
 
 def _guess_ct(name, fallback="application/octet-stream"):
@@ -53,7 +99,7 @@ def _guess_ct(name, fallback="application/octet-stream"):
 
 class WebDAVHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "TelegramWebDAV/1.0"
+    server_version = "TelegramWebDAV/1.1"
 
     # ---------------- 通用 ----------------
     @property
@@ -66,88 +112,313 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
-    # ---------------- 请求体卫生（keep-alive 兼容） ----------------
+    # ---------------- 请求级状态 ----------------
     def __init__(self, *args, **kwargs):
         self._body_read = 0
         self._hdr_status = 0
         self._hdr_conn_sent = False
+        self._response_started = False
+        self._request_body = None
+        self._read_timeout = _BODY_TIMEOUT
         super().__init__(*args, **kwargs)
 
     def handle_one_request(self):
-        """每个请求处理完都确保读净请求体。"""
+        """每个请求处理完都确保读净请求体并清理残包（keep-alive 兼容）。
+
+        异常分三类处置，这一点很关键：
+          - 客户端断开（ConnectionError）：静默结束，无需响应；
+          - 读超时（空闲连接等待下一个请求 / SocketIO 已被标记超时）：
+            这是 HTTP 服务器正常的连接回收，静默关闭即可，**绝不能回 500**——
+            否则 keep-alive 复用时客户端会莫名收到 500，表现出来就是挂载失灵；
+          - 其它异常：回 500 并关连接，且只吐一行纯文本，不漏 traceback/HTML。
+        """
         self._body_read = 0
+        self._hdr_status = 0
+        self._hdr_conn_sent = False
+        self._response_started = False
+        self._request_body = None
+        try:
+            self.connection.settimeout(self.app.config.idle_timeout)
+        except Exception:
+            pass
         try:
             super().handle_one_request()
+        except (ConnectionError, TimeoutError, socket.timeout):
+            self.close_connection = True
+            return
+        except Exception as e:  # noqa: BLE001
+            if _is_timeout_err(e):
+                self.close_connection = True
+                return
+            self._send_error(500, f"internal error: {type(e).__name__}")
+            self.close_connection = True
         finally:
-            self._drain_body()
+            try:
+                self._drain_body()
+            except Exception:
+                self.close_connection = True
 
     def send_response(self, code, message=None):
-        """每条连接只服务一个请求。
+        """发送状态行。
 
-        AList / OpenList 的 WebDav 驱动构造 PROPFIND 的 XML body 时，
-        Content-Length 比真实 body 少算 1 个字节（尾部那个 \\n 没算进去）。
-        keep-alive 下，这个残留字节会被服务端当成下一个请求的起始行，
-        于是吐出 Python 自带的 HTML 400 错误页，客户端侧表现就是
-        `malformed HTTP status code "HTML>"`。
-        请求处理完即关闭连接，可以从根上杜绝这类边界错位。
+        - 记录状态、标记响应已开始（异常兜底时避免重复发响应）。
+        - 若配置了 ``DAV_KEEPALIVE=off``，则每条连接只服务一次（保守模式）。
+        - 是否 keep-alive 由「客户端意图 + 残包检测结果」共同决定，最终在
+          ``end_headers`` 里写进 ``Connection`` 头。
         """
         self._hdr_status = code
         self._hdr_conn_sent = False
-        self.close_connection = True
+        self._response_started = True
+        if not self.app.config.keepalive:
+            self.close_connection = True
         super().send_response(code, message)
 
     def end_headers(self):
-        if self._hdr_status >= 200 and not self._hdr_conn_sent:
+        if not self._hdr_conn_sent:
             self._hdr_conn_sent = True
             try:
-                self.send_header("Connection", "close")
+                self.send_header("Connection", "close" if self.close_connection else "keep-alive")
             except Exception:
                 pass
         super().end_headers()
 
-    def _read_body(self, n):
-        """读取请求体并记账（PUT 流式上传用）。"""
-        data = self.rfile.read(n)
-        self._body_read += len(data)
+    def _send(self, status, headers, body=None):
+        self.send_response(status)
+        self.send_header("Date", _now_http(time.time()))
+        for k, v in headers.items():
+            self.send_header(k, v)
+        if body is None:
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if "Content-Length" not in headers:
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                self.wfile.write(body)
+            except (ConnectionError, OSError):
+                # 客户端中途断开，静默结束
+                pass
+
+    def _send_error(self, code, msg):
+        """兜底错误响应：保证一定发出去，且绝不吐 Python 原始 traceback。"""
+        if self._response_started and self._hdr_status >= 100 and self._hdr_status < 400:
+            # 响应已部分写出（如流式下载中），只能关连接
+            self.close_connection = True
+            return
+        try:
+            body = msg.encode("utf-8", "replace")
+            self.send_response(code)
+            self.send_header("Date", _now_http(time.time()))
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if self.command != "HEAD":
+                try:
+                    self.wfile.write(body)
+                except (ConnectionError, OSError):
+                    pass
+        except Exception:
+            self.close_connection = True
+
+    # ---------------- 请求体读取与残包检测 ----------------
+    def _read_exact(self, n):
+        """读取恰好 n 字节（带超时保护），并记账到 ``_body_read``。"""
+        buf = bytearray()
+        if n <= 0:
+            return bytes(buf)
+        orig = None
+        try:
+            orig = self.connection.gettimeout()
+            self.connection.settimeout(self._read_timeout)
+        except Exception:
+            pass
+        try:
+            while len(buf) < n:
+                chunk = self.rfile.read(min(n - len(buf), 65536))
+                if not chunk:
+                    break  # 客户端断开或提前结束
+                buf += chunk
+                self._body_read += len(chunk)
+        finally:
+            try:
+                self.connection.settimeout(orig)
+            except Exception:
+                pass
+        return bytes(buf)
+
+    def _read_chunked(self):
+        """读取 chunked 编码的请求体（兜底，WebDAV 客户端多用 Content-Length）。"""
+        buf = bytearray()
+        try:
+            self.connection.settimeout(self._read_timeout)
+        except Exception:
+            pass
+        try:
+            while True:
+                line = self.rfile.readline(65536)
+                if not line:
+                    break
+                line = line.split(b";", 1)[0].strip()
+                if not line:
+                    continue
+                try:
+                    size = int(line, 16)
+                except ValueError:
+                    break
+                if size == 0:
+                    break
+                remaining = size
+                while remaining > 0:
+                    part = self.rfile.read(min(remaining, 65536))
+                    if not part:
+                        break
+                    buf += part
+                    self._body_read += len(part)
+                    remaining -= len(part)
+                self.rfile.readline()  # 块后 CRLF
+        finally:
+            try:
+                self.connection.settimeout(self.app.config.idle_timeout)
+            except Exception:
+                pass
+        return bytes(buf)
+
+    def _peek_nonblocking(self):
+        """非破坏性地看一眼「还有没有字节可读」（rfile 缓冲 or 内核缓冲）。
+
+        为什么不能直接 ``self.rfile.peek(1)``：
+          - ``peek`` 在缓冲为空时会**一直阻塞到套接字超时**——拿空闲超时（30s）去
+            peek，每条请求都要白等，吞吐直接崩；
+          - 更糟的是一旦触发超时，``SocketIO`` 会被永久标记成 timed out，之后这条
+            连接上任何读都抛 ``OSError('cannot read from timed out object')``，
+            表现出来就是莫名的 500。
+        所以这里临时切成非阻塞（timeout=0）看一眼，用完立刻还原。
+        """
+        old = None
+        try:
+            old = self.connection.gettimeout()
+            self.connection.settimeout(0)
+        except Exception:
+            pass
+        try:
+            return self.rfile.peek(1) or b""
+        except Exception:
+            return b""
+        finally:
+            try:
+                self.connection.settimeout(old)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _looks_like_request(buf):
+        """缓冲开头是否像一条新的 HTTP 请求起始行（即流水线里的下一条请求）。
+
+        RFC 7230 §3.5 允许请求行前先来一个空行（CRLF），所以先剥掉前导换行再判断——
+        否则 AList 多发的那个 ``\\n`` 后面紧跟的合法请求会被误判成垃圾。
+        """
+        if not buf:
+            return False
+        line = buf[:1024].lstrip(b"\r\n").split(b"\n", 1)[0].rstrip(b"\r")
+        parts = line.split()
+        if len(parts) != 3:
+            return False
+        method, target, ver = parts
+        if method not in _HTTP_METHODS:
+            return False
+        if not (target.startswith(b"/") or target == b"*" or b"://" in target):
+            return False
+        return ver.startswith(b"HTTP/")
+
+    def _drain_residual(self, limit=_RESIDUAL_LIMIT):
+        """清掉 Content-Length 之外多出来的垃圾字节，返回丢弃的字节数。
+
+        AList/OpenList 等客户端偶尔把 Content-Length 少算 1 字节（XML body 尾部
+        多一个 ``\\n``）。这些字节若留在连接上，keep-alive 下会被当成下一条请求的
+        起始行，服务端吐 400 HTML，客户端就报
+        ``malformed HTTP status code "HTML>"``。
+
+        处理策略（比"一发现残留就关连接"更好）：
+          - 不像新请求起始行的前导字节 -> 直接丢掉，连接照样能复用；
+          - 撞上一条看起来合法的请求 -> 立刻停手，那是流水线，交给下一轮处理；
+          - 丢到上限还在丢 -> 客户端严重错乱，关连接。
+        """
+        dropped = 0
+        try:
+            while dropped < limit:
+                buf = self._peek_nonblocking()
+                if not buf or self._looks_like_request(buf):
+                    break
+                self.rfile.read(1)
+                dropped += 1
+        except Exception:
+            self.close_connection = True
+        if dropped >= limit:
+            self.close_connection = True
+        return dropped
+
+    def _consume_body(self):
+        """读取整个请求体（若有），并返回字节；同时探测残留字节。
+
+        供 PROPFIND/LOCK/PROPPATCH/DELETE/MKCOL/COPY/MOVE/webhook 等使用。
+        在发送响应之前调用，这样若发现残留可立即标记关闭连接，``Connection`` 头才准确。
+        """
+        te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
+        if "chunked" in te:
+            return self._read_chunked()
+        cl = self.headers.get("Content-Length")
+        if cl is None:
+            return b""  # 无体的请求
+        try:
+            n = int(cl)
+        except ValueError:
+            n = 0
+        data = self._read_exact(n)
+        self._drain_residual()
         return data
 
     def _drain_body(self):
-        """丢弃尚未读取的请求体。
-
-        Go / Alist / rclone 等客户端在 PROPFIND、MKCOL、DELETE 里也会带 XML body，
-        而 401/404/409 这类提前返回的分支从不读它。残留的 body 会被当成下一个
-        请求的起始行来解析，服务端于是吐出 Python 自带的 HTML 400 页
-        （`<!DOCTYPE HTML>` … `Bad HTTP/0.9 request type`），连接就此错乱 ——
-        客户端侧表现为 `malformed HTTP status code "HTML>"`。
-
-        另外给读取加了超时：某些客户端声称的 Content-Length 比真实 body 大，
-        死等会把线程拖死 —— 读不净就直接关连接（反正每条连接只用一次）。
-        """
+        """安全网：处理完请求后若仍有未读的请求体，读净它，并清理残包。"""
         try:
+            if self.headers is None:
+                return  # 请求行都没解析出来（空闲超时等），没什么可读的
             te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
-            # 给读取加个短超时，避免 Content-Length 虚高时在这里卡死
-            try:
-                self.connection.settimeout(1.0)
-            except Exception:
-                pass
             if "chunked" in te:
-                # 一路读到 0\r\n 块或 EOF
-                while True:
-                    line = self.rfile.readline(65536)
-                    if not line or line in (b"\r\n", b"\n"):
-                        break
+                try:
+                    self._read_chunked()
+                except Exception:
+                    self.close_connection = True
                 return
-            raw_len = self.headers.get("Content-Length")
-            if raw_len is None:
+            cl = self.headers.get("Content-Length")
+            if cl is None:
                 return
-            left = int(raw_len) - getattr(self, "_body_read", 0)
-            while left > 0:
-                part = self.rfile.read(min(left, 262144))
-                if not part:
-                    break
-                left -= len(part)
+            try:
+                n = int(cl)
+            except ValueError:
+                self.close_connection = True
+                return
+            left = n - self._body_read
+            if left > 0:  # handler 没读净（异常提前返回等），补读
+                try:
+                    self.connection.settimeout(self._read_timeout)
+                    while left > 0:
+                        part = self.rfile.read(min(left, 262144))
+                        if not part:
+                            break
+                        left -= len(part)
+                    if left > 0:
+                        self.close_connection = True
+                except Exception:
+                    self.close_connection = True
+                finally:
+                    try:
+                        self.connection.settimeout(self.app.config.idle_timeout)
+                    except Exception:
+                        pass
+            self._drain_residual()
         except Exception:
-            # 读不干净就让这条连接死掉，宁可重建连接也不要留下脏数据
             self.close_connection = True
 
     def _auth_ok(self):
@@ -166,28 +437,54 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
     def _require_auth(self):
         if not self._auth_ok():
-            self.send_response(401)
-            self.send_header("WWW-Authenticate", 'Basic realm="telegram-webdav"')
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._send(
+                401,
+                {"WWW-Authenticate": 'Basic realm="telegram-webdav"'},
+                b"401 Unauthorized",
+            )
             return False
         return True
 
     def _normalize_path(self, raw):
+        """把任意形式的请求目标规范化为内部绝对路径（无尾斜杠，根仍为 ``/``）。
+
+        - 兼容代理发来的绝对形式 ``http://host/path``（取 path 部分）。
+        - 兼容有无尾斜杠：``/foo`` 与 ``/foo/`` 都归一成 ``/foo``。
+        - 兼容 ``DAV_ROOT`` 挂载：把挂载前缀剥掉。
+        - 拒绝 ``..`` 路径穿越，避免越权访问挂载点之外。
+        - 折叠多余 ``/``。
+        """
+        if raw is None:
+            return None
         p = urllib.parse.urlsplit(raw).path
         p = urllib.parse.unquote(p)
         if not p.startswith("/"):
             p = "/" + p
-        if self.app.config.root_path not in ("", "/"):
-            rp = self.app.config.root_path.rstrip("/")
+        # 路径穿越防护
+        if ".." in p.split("/"):
+            return None
+        p = re.sub(r"/+", "/", p)
+        rp = self.app.config.root_path
+        if rp not in ("", "/"):
+            rp = rp.rstrip("/")
             if p == rp or p.startswith(rp + "/"):
                 p = p[len(rp):] or "/"
             else:
                 return None
-        p = re.sub(r"/+", "/", p)
         if p != "/":
             p = p.rstrip("/")
         return p
+
+    def _href(self, path, is_dir):
+        """生成对外 href：集合补尾斜杠，并带 ``DAV_ROOT`` 挂载前缀。"""
+        rp = self.app.config.root_path
+        if rp in ("", "/"):
+            h = path
+        else:
+            h = rp.rstrip("/") + path
+        if is_dir and not h.endswith("/"):
+            h += "/"
+        return h
 
     def _parse_range(self, total):
         h = self.headers.get("Range", "")
@@ -198,6 +495,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if s == "" and e == "":
             return None
         if s == "":
+            # 后缀范围 bytes=-N
             n = int(e)
             if n <= 0:
                 return None
@@ -206,23 +504,9 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         else:
             start = int(s)
             end = int(e) if e else total - 1
-        if start > end or start >= total:
+        if start < 0 or end < start or start >= total:
             return "invalid"
         return (start, min(end, total - 1))
-
-    def _send(self, status, headers, body=None):
-        self.send_response(status)
-        for k, v in headers.items():
-            self.send_header(k, v)
-        if body is None:
-            self.send_header("Content-Length", "0")
-            self.end_headers()
-            return
-        if "Content-Length" not in headers:
-            self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
 
     # ---------------- OPTIONS ----------------
     def do_OPTIONS(self):
@@ -234,6 +518,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 "DAV": "1, 2",
                 "Allow": "OPTIONS, PROPFIND, GET, HEAD, PUT, DELETE, MKCOL, MOVE, COPY, LOCK, UNLOCK, PROPPATCH",
                 "MS-Authoring-FrontPage": "none",
+                "Accept-Ranges": "bytes",
             },
         )
 
@@ -243,26 +528,23 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
+        # 读净请求体（含残包检测），避免 keep-alive 错位
+        self._consume_body()
         depth = self.headers.get("Depth", "1")
+        if depth not in ("0", "1", "infinity"):
+            depth = "1"
         self_node, children = self.app.db.list_children(path, depth)
         if self_node is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
         xml = self._build_propfind(path, self_node, children)
         self._send(
             207,
             {"Content-Type": 'application/xml; charset="utf-8"'},
             xml.encode("utf-8"),
         )
-
-    def _href(self, path, is_dir):
-        h = path
-        if is_dir and h != "/":
-            h += "/"
-        return h
 
     def _build_propfind(self, base, self_node, children):
         items = [self_node] + children
@@ -305,26 +587,30 @@ class WebDAVHandler(BaseHTTPRequestHandler):
     def _serve_file(self, head_only):
         path = self._normalize_path(self.path)
         if path is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         node = self.app.db.get_node(path)
         if node is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         if node["is_dir"]:
-            # 目录不支持 GET，返回 404（客户端用 PROPFIND 列举）
-            self._send(404, {"Content-Type": "text/plain"})
+            # 目录：重定向到带尾斜杠的形式（浏览器/Windows 相对路径更稳）
+            self._send(
+                301,
+                {"Location": self._href(path, True)},
+                b"301 Moved Permanently",
+            )
             return
 
         total = node["size"]
-        # 空文件：Telegram 无法存 0 字节，元数据打标为无分片 -> 直接返回空
         chunks = json.loads(node["chunks"]) if node.get("chunks") else []
 
         rng = self._parse_range(total) if not head_only else None
         if rng == "invalid":
             self._send(
                 416,
-                {"Content-Range": f"bytes */{total}", "Content-Type": "text/plain"},
+                {"Content-Range": f"bytes */{total}", "Content-Type": "text/plain; charset=utf-8"},
+                b"416 Range Not Satisfiable",
             )
             return
 
@@ -351,35 +637,38 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         # 流式拼接分片
         self.send_response(status)
+        self.send_header("Date", _now_http(time.time()))
         for k, v in headers.items():
             self.send_header(k, v)
         self.end_headers()
 
-        if total == 0:
+        if total == 0 or not chunks:
             return
 
-        # 定位覆盖 [start,end] 的分片，逐片按相对 Range 向 TG 请求
         offset = 0
-        for c in chunks:
-            csize = c["size"]
-            cstart = offset
-            cend = offset + csize - 1
-            offset += csize
-            if cend < start or cstart > end:
-                continue
-            rs = max(cstart, start) - cstart
-            re_ = min(cend, end) - cstart
-            try:
+        try:
+            for c in chunks:
+                csize = c["size"]
+                cstart = offset
+                cend = offset + csize - 1
+                offset += csize
+                if cend < start or cstart > end:
+                    continue
+                rs = max(cstart, start) - cstart
+                re_ = min(cend, end) - cstart
                 for block in self.app.backend.iter_chunk(
                     c["file_id"], c.get("slot", 0), rs, re_
                 ):
                     if not block:
                         break
-                    self.wfile.write(block)
-            except _tg.TGError as e:
-                # 已部分写出，无法回滚；记录错误
-                print(f"[webdav] 下载分片失败 {path}: {e}", flush=True)
-                return
+                    try:
+                        self.wfile.write(block)
+                    except (ConnectionError, OSError):
+                        # 客户端中途断开，静默结束
+                        return
+        except _tg.TGError as e:
+            print(f"[webdav] 下载分片失败 {path}: {e}", flush=True)
+            self.close_connection = True
 
     # ---------------- PUT ----------------
     def do_PUT(self):
@@ -387,20 +676,26 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None:
-            self._send(403, {"Content-Type": "text/plain"})
+            self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         if self.app.backend is None:
             self._send(503, {"Content-Type": "text/plain; charset=utf-8"},
                        "Telegram 未配置，无法存储".encode("utf-8"))
             return
 
+        # 条件头：If-None-Match: * 表示「仅当不存在时创建」
+        if_none = self.headers.get("If-None-Match", "")
+        existed = self.app.db.get_node(path) is not None
+        if if_none == "*" and existed:
+            self._send(412, {"Content-Type": "text/plain; charset=utf-8"},
+                       b"412 Precondition Failed (already exists)")
+            return
+
         parent = "/" if path == "/" else path.rsplit("/", 1)[0] or "/"
         pnode = self.app.db.get_node(parent)
         if pnode is None or not pnode["is_dir"]:
-            self._send(409, {"Content-Type": "text/plain"})  # Conflict: 父目录不存在
+            self._send(409, {"Content-Type": "text/plain; charset=utf-8"})  # Conflict: 父目录不存在
             return
-
-        existed = self.app.db.get_node(path) is not None
 
         # 处理 Expect: 100-continue
         if self.headers.get("Expect", "").lower() == "100-continue":
@@ -413,24 +708,36 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             ct = _guess_ct(path.rsplit("/", 1)[-1])
 
         chunk_size = self.app.config.chunk_size
+        # 原始文件名：写进 Telegram 频道消息，让人浏览频道时看到的就是原文件名
+        # （参考 otterhub-server 的做法）。单分片直接用原名；多分片加 .partNN 后缀，
+        # 既保留原文件名线索，又能把不同分片区分开。
+        orig_name = path.rsplit("/", 1)[-1] or "file.bin"
+        multi = total > chunk_size
         chunks_meta = []
+        ci = 0
         try:
             remaining = total
             while remaining > 0:
                 want = min(chunk_size, remaining)
                 buf = b""
                 while len(buf) < want:
-                    part = self._read_body(want - len(buf))
+                    part = self._read_exact(want - len(buf))
                     if not part:
                         break
                     buf += part
                 if len(buf) != want:
                     raise _tg.TGError("请求体长度不足（客户端提前断开）")
-                fid, slot, mid = self.app.backend.upload_chunk(buf)
+                chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
+                fid, slot, mid = self.app.backend.upload_chunk(
+                    buf, file_name=chunk_name
+                )
                 chunks_meta.append(
                     {"file_id": fid, "slot": slot, "size": len(buf), "message_id": mid}
                 )
                 remaining -= len(buf)
+                ci += 1
+            # 清理残留字节（AList 类 CL 少算），必要时关闭连接
+            self._drain_residual()
         except _tg.TGError as e:
             self._send(502, {"Content-Type": "text/plain; charset=utf-8"},
                        f"上传到 Telegram 失败: {e}".encode("utf-8"))
@@ -448,11 +755,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None or path == "/":
-            self._send(403, {"Content-Type": "text/plain"})
+            self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
+        self._consume_body()  # AList 会给 DELETE 带 body，先读净
         node = self.app.db.get_node(path)
         if node is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         self.app.db.delete_recursive(path)
         # 注意：Telegram 不支持删除已发消息，物理分片仍留在频道（与 otterhub 一致）
@@ -464,15 +772,16 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None or path == "/":
-            self._send(403, {"Content-Type": "text/plain"})
+            self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
+        self._consume_body()  # 读净可能的 body（部分客户端会发空 XML）
         if self.app.db.get_node(path) is not None:
-            self._send(405, {"Content-Type": "text/plain"})  # Method Not Allowed
+            self._send(405, {"Content-Type": "text/plain; charset=utf-8"})  # Method Not Allowed
             return
         parent = "/" if path == "/" else path.rsplit("/", 1)[0] or "/"
         pnode = self.app.db.get_node(parent)
         if pnode is None or not pnode["is_dir"]:
-            self._send(409, {"Content-Type": "text/plain"})
+            self._send(409, {"Content-Type": "text/plain; charset=utf-8"})
             return
         self.app.db.create_dir(path)
         self._send(201, {"Content-Type": "text/plain"})
@@ -498,28 +807,32 @@ class WebDAVHandler(BaseHTTPRequestHandler):
     def _move_or_copy(self, copy):
         src = self._normalize_path(self.path)
         dst = self._parse_destination()
+        self._consume_body()  # 读净可能的 body
         if src is None or dst is None:
-            self._send(400, {"Content-Type": "text/plain"})
+            self._send(400, {"Content-Type": "text/plain; charset=utf-8"}, b"400 Bad Request")
+            return
+        if src == dst:
+            self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         if self.app.db.get_node(src) is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         if dst.startswith(src + "/"):
-            self._send(423, {"Content-Type": "text/plain"})  # Locked: 不能移入自身子树
+            self._send(423, {"Content-Type": "text/plain; charset=utf-8"})  # Locked: 不能移入自身子树
             return
         dst_existed = self.app.db.get_node(dst) is not None
         overwrite = (self.headers.get("Overwrite", "T").upper() != "F")
         if dst_existed and not overwrite:
-            self._send(412, {"Content-Type": "text/plain"})  # Precondition Failed
+            self._send(412, {"Content-Type": "text/plain; charset=utf-8"})  # Precondition Failed
             return
         parent = "/" if dst == "/" else dst.rsplit("/", 1)[0] or "/"
         pnode = self.app.db.get_node(parent)
         if pnode is None or not pnode["is_dir"]:
-            self._send(409, {"Content-Type": "text/plain"})
+            self._send(409, {"Content-Type": "text/plain; charset=utf-8"})
             return
         ok = self.app.db.copy(src, dst) if copy else self.app.db.move(src, dst)
         if not ok:
-            self._send(500, {"Content-Type": "text/plain"})
+            self._send(500, {"Content-Type": "text/plain; charset=utf-8"}, b"500 Internal Error")
             return
         self._send(204 if dst_existed else 201, {"Content-Type": "text/plain"})
 
@@ -529,7 +842,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None:
-            self._send(403, {"Content-Type": "text/plain"})
+            self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         # 刷新已有锁（If 头带 lock token）
         ifh = self.headers.get("If", "")
@@ -543,8 +856,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             token = "opaquelocktoken:" + hashlib.sha1(
                 (path + str(time.time()) + str(id(self))).encode()
             ).hexdigest()
+        body = self._consume_body()
         owner = ""
-        body = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
         om = re.search(r"<D:href>([^<]*)</D:href>", body.decode("utf-8", "replace"))
         if om:
             owner = om.group(1)
@@ -589,14 +902,13 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         path = self._normalize_path(self.path)
         if path is None or self.app.db.get_node(path) is None:
-            self._send(404, {"Content-Type": "text/plain"})
+            self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
-        # 最小化实现：接受死属性写入，返回 207 全部成功（不持久化具体属性）
-        self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+        self._consume_body()  # 接受死属性写入
         xml = (
             '<?xml version="1.0" encoding="utf-8"?>'
             '<D:multistatus xmlns:D="DAV:">'
-            f"  <D:response><D:href>{xml.sax.saxutils.escape(path)}</D:href>"
+            f"  <D:response><D:href>{xml.sax.saxutils.escape(self._href(path, False))}</D:href>"
             '    <D:propstat><D:prop/>'
             "    <D:status>HTTP/1.1 200 OK</D:status></D:propstat>"
             "  </D:response>"
@@ -611,29 +923,28 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if self.path.startswith("/telegram/webhook"):
             self._handle_webhook()
             return
-        self._send(405, {"Content-Type": "text/plain"})
+        self._send(405, {"Content-Type": "text/plain; charset=utf-8"}, b"405 Method Not Allowed")
 
     def _handle_webhook(self):
         cfg = self.app.config
-        # 校验密钥（Telegram 在以 X-Telegram-Bot-Api-Secret-Token 头发送）
         secret = self.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
         if cfg.webhook_secret and secret != cfg.webhook_secret:
-            self._send(403, {"Content-Type": "text/plain"})
+            self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         if self.app.backend is None:
-            self._send(503, {"Content-Type": "text/plain"})
+            self._send(503, {"Content-Type": "text/plain; charset=utf-8"},
+                       b"503 Telegram not configured")
             return
-        # 从路径解析 slot：/telegram/webhook 或 /telegram/webhook/1
         slot = 0
         mm = re.match(r"/telegram/webhook/(\d+)", self.path)
         if mm:
             slot = int(mm.group(1)) % max(1, len(self.app.backend.slots))
 
         try:
-            raw = self.rfile.read(int(self.headers.get("Content-Length", 0) or 0))
+            raw = self._consume_body()
             update = json.loads(raw.decode("utf-8", "replace"))
         except Exception:
-            self._send(400, {"Content-Type": "text/plain"})
+            self._send(400, {"Content-Type": "text/plain; charset=utf-8"}, b"400 Bad Request")
             return
 
         message = (
@@ -647,7 +958,6 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self._send(200, {"Content-Type": "text/plain"})  # 非媒体消息，忽略
             return
 
-        # 落库到导入目录（文件名去重）
         base = cfg.import_dir
         if self.app.db.get_node(base) is None:
             self.app.db.create_dir(base)
@@ -659,7 +969,6 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             suffix = f"_{i}" if dot else f"_{i}"
             dest = f"{base}/{stem}{suffix}{dot}{ext}" if dot else f"{base}/{name}{suffix}"
             i += 1
-        # 单分片：整文件已在频道里，file_id + slot 即索引
         self.app.db.create_file(
             dest,
             media["content_type"],
