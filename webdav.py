@@ -893,25 +893,61 @@ class WebDAVHandler(BaseHTTPRequestHandler):
              f"Range={self.headers.get('Range')} "
              f"(原并发版会触发 keep-alive 池互锁/单bot限流/分片间result阻塞，已改为串行)")
 
+        def _fmt_speed_local(n, dt):
+            if not dt or dt <= 0:
+                return "∞"
+            bps = n / dt
+            if bps >= 1024 * 1024 * 1024:
+                return f"{bps / 1024 / 1024 / 1024:.2f} GB/s"
+            if bps >= 1024 * 1024:
+                return f"{bps / 1024 / 1024:.2f} MB/s"
+            if bps >= 1024:
+                return f"{bps / 1024:.2f} KB/s"
+            return f"{bps:.0f} B/s"
+
         sent = 0
+        # 每分片时间线：用于诊断"分片间是否卡顿"。理想情况下相邻分片间隔≈0。
+        tl = []  # (ci, 下载耗时, 写回耗时, 分片间隔, 字节数)
+        last_done = time.time()  # 上一片处理完（写回客户端）的时刻
         try:
             if rest:
                 # 首片流式转发（边下边发，立刻有首字节）
+                t_dl = time.time()
                 sent = self._stream_chunk(first)
+                dl_t = time.time() - t_dl
+                tl.append((first[0], dl_t, 0.0, 0.0, sent))
+                _log(f"GET 分片[{first[0]}](首) 下载完成: 下载耗时={dl_t:.3f}s "
+                     f"大小={_fmt_size(sent)}({sent}B) 吞吐={_fmt_speed_local(sent, dl_t)} "
+                     f"TTFB后延迟={time.time() - t0:.3f}s")
+                last_done = time.time()
                 # 剩余分片：主线程串行下载 → 校验 → 回写，零线程竞争 / 零 result() 串行阻塞
                 for ci, c, cstart, cend, rs, re_, verify in rest:
+                    t_dl = time.time()
                     _, data = _collect(ci, c, rs, re_)
+                    dl_t = time.time() - t_dl
+                    gap = t_dl - last_done  # 上片写回完 → 本片开始下载之间的间隔（卡顿核心指标）
                     if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
                         raise _IntegrityError(cstart)
+                    t_wr = time.time()
                     try:
                         self.wfile.write(data)
                         sent += len(data)
                     except (ConnectionError, OSError):
                         # 客户端中途断开：立刻停止（不需要 cancel 线程池了）
                         raise _ClientGone(sent)
+                    wr_t = time.time() - t_wr
+                    tl.append((ci, dl_t, wr_t, gap, len(data)))
+                    _log(f"GET 分片[{ci}] 下载完成: 下载耗时={dl_t:.3f}s 写回耗时={wr_t:.3f}s "
+                         f"分片间隔={gap:.3f}s 大小={_fmt_size(len(data))}({len(data)}B) "
+                         f"吞吐={_fmt_speed_local(len(data), dl_t)}")
+                    last_done = time.time()
             else:
-                # 单分片：直接流式转发
+                t_dl = time.time()
                 sent = self._stream_chunk(first)
+                dl_t = time.time() - t_dl
+                tl.append((first[0], dl_t, 0.0, 0.0, sent))
+                _log(f"GET 分片[{first[0]}](首) 下载完成: 下载耗时={dl_t:.3f}s "
+                     f"大小={_fmt_size(sent)}({sent}B) 吞吐={_fmt_speed_local(sent, dl_t)}")
         except _ClientGone as e:
             _log(f"GET 客户端提前断开(已停止): path={path} 已发={_fmt_size(sent)} "
                  f"耗时={time.time() - t0:.2f}s 吞吐={_fmt_speed(sent, time.time() - t0)}")
@@ -929,9 +965,17 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             _log(f"GET 下载分片失败(连接中断): path={path} 错误={e} 已发={_fmt_size(sent)}")
             self.close_connection = True
             return
+        dt_total = time.time() - t0
+        # 卡顿诊断：相邻分片「写回完→下一片开始下载」的最大间隔；
+        # 单线程串行下应≈0，若出现明显尖峰即说明某分片下载/写回异常阻塞。
+        gaps = [g for (_, _, _, g, _) in tl[1:]]  # 跳过首片（无前置间隔）
+        max_gap = max(gaps) if gaps else 0.0
+        dl_times = [d for (_, d, _, _, _) in tl]
         _log(f"GET 完成: path={path} 状态={status} 区间={start}-{end}/{total} "
-             f"已发={_fmt_size(sent)}({sent}B) 耗时={time.time() - t0:.2f}s "
-             f"吞吐={_fmt_speed(sent, time.time() - t0)} 模式=单线程串行 "
+             f"已发={_fmt_size(sent)}({sent}B) 耗时={dt_total:.2f}s "
+             f"吞吐={_fmt_speed(sent, dt_total)} 模式=单线程串行 "
+             f"分片数={len(tl)} 最大分片间隔={max_gap:.3f}s "
+             f"(卡顿指标:≈0表示分片平滑衔接) "
              f"类型={_media_kind(content_type, path.rsplit('/', 1)[-1])} "
              f"时长={_fmt_dur(dur)}")
 

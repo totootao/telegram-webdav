@@ -55,6 +55,20 @@ def _log(msg):
     print(f"[{ts}][tg] {msg}", flush=True)
 
 
+def _fmt_speed(n, dt):
+    """字节数/秒 → 人类可读速率字符串（与 webdav._fmt_speed 同款）。"""
+    if not dt or dt <= 0:
+        return "∞"
+    bps = n / dt
+    if bps >= 1024 * 1024 * 1024:
+        return f"{bps / 1024 / 1024 / 1024:.2f} GB/s"
+    if bps >= 1024 * 1024:
+        return f"{bps / 1024 / 1024:.2f} MB/s"
+    if bps >= 1024:
+        return f"{bps / 1024:.2f} KB/s"
+    return f"{bps:.0f} B/s"
+
+
 def _mp_boundary():
     return "----tgwebdav" + uuid.uuid4().hex
 
@@ -511,6 +525,7 @@ class TelegramBackend:
         idx = slot % n
         cands = self._candidates.get(idx) or [(self.api_base, self.proxy_token)]
         last = None
+        t0 = time.time()  # 本分片下载总计时起点（发起 getFile 之前）
         for ci, (api_base, proxy_token) in enumerate(cands):
             try:
                 fp = self._get_file_path(file_id, token, api_base, proxy_token)
@@ -538,17 +553,25 @@ class TelegramBackend:
                     _log(f"iter_chunk 代理候选 {ci} 失败({msg})，切换下一代理: api={api_base}")
                     continue
                 total_yield = 0
+                t_first = None  # 首字节到达时刻（TTFB 依据）
                 try:
                     while True:
                         b = resp.read(blk)
                         if not b:
                             break
+                        if t_first is None:
+                            t_first = time.time()
                         total_yield += len(b)
                         yield b
                 finally:
                     # 读完整响应体后才归还连接，保证 keep-alive 连接可安全复用
                     self._release_conn(base, conn, alive)
-                _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield}")
+                dt_total = time.time() - t0
+                dt_first = (t_first - t0) if t_first is not None else dt_total
+                _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield} "
+                     f"总耗时={dt_total:.3f}s 首字节={dt_first:.3f}s "
+                     f"吞吐={_fmt_speed(total_yield, dt_total)} "
+                     f"proxy={api_base}")
                 return
             except TGError:
                 raise
