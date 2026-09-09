@@ -115,8 +115,9 @@ def _load_proxy_pools(proxy_token):
       - 对象数组: [{"apiBase":"https://p1/tg","proxyToken":"t1"}, ...]
     返回 [(api_base, proxy_token), ...]，与每 bot 自带的 apiBase 合并成该 bot 的候选代理列表。
 
-    请求级轮询分摊 + 失败自动切换：某代理报错/超时则跳到下一个，实现「多个 TG 代理」的
-    负载均衡与容灾。
+    语义是「按序主备 + 失败自动切换」：正常走候选 0，失败才退到下一个。
+    注意 TG_API_BASE 配的主代理会作为兜底候选保留（见 tg._build_candidates），
+    配了本项不会把它换掉。
     """
     raw = os.environ.get("TG_PROXY_POOLS")
     out = []

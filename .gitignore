@@ -6,3 +6,6 @@
 __pycache__/
 *.pyc
 .DS_Store
+
+# 测试运行时产物
+*.log

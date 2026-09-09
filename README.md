@@ -265,7 +265,7 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId","apiBase"(可选,字符串或数组),"proxyToken"(可选,字符串或数组)}]`；分摊 1 msg/s 流控。`apiBase`/`proxyToken` 缺省时回退全局变量；`apiBase` 写成数组即「该 bot 走多个 TG 代理」 | 空 |
 | `TG_API_BASE` | 全局 Telegram API 代理基址（国内/被墙用），作为各 bot 未单独指定 `apiBase` 时的默认回退 | `https://api.telegram.org` |
 | `TG_PROXY_TOKEN` | 全局代理鉴权令牌，以 `Authorization: Bearer` 头发出，作为各 bot 未单独指定 `proxyToken` 时的默认回退；官方 API 场景留空 | 空 |
-| `TG_PROXY_POOLS` | 全局代理候选池（所有 bot 共享），JSON 数组：字符串数组 `["https://p1/tg","https://p2/tg"]` 或对象数组 `[{"apiBase":"https://p1/tg","proxyToken":"t1"},...]`；与每 bot 自带 `apiBase` 合并成候选列表，请求级轮询分摊 + 失败自动切换（多个 TG 代理的负载均衡与容灾） | 空 |
+| `TG_PROXY_POOLS` | 全局代理候选池（所有 bot 共享），JSON 数组：字符串数组 `["https://p1/tg","https://p2/tg"]` 或对象数组 `[{"apiBase":"https://p1/tg","proxyToken":"t1"},...]`；与每 bot 自带 `apiBase` 合并成候选列表，按序主备 + 失败自动切换（见下方「多个 TG 代理」）。**不会**顶掉 `TG_API_BASE`——主代理始终作为兜底候选保留 | 空 |
 | `CHUNK_SIZE_MB` | 分片大小（≤20 即可走官方 Bot API；自建 Bot API Server 可到 2000） | `20` |
 | `DB_PATH` | SQLite 文件路径 | `./telegram_webdav.db` |
 | `DAV_USER` / `DAV_PASSWORD` | Basic 认证（建议必填） | 空（关闭认证） |
@@ -366,6 +366,44 @@ docker run -d --name tg-webdav \
   totootao/telegram-webdav:latest
 ```
   未在某 bot 写 `apiBase`/`proxyToken` 时，自动回退到全局 `TG_API_BASE`/`TG_PROXY_TOKEN`。
+
+### 多个 TG 代理（主备 + 容灾切换）
+
+手上不止一个 TG 代理时，把额外的配进 `TG_PROXY_POOLS`，某个代理挂了会自动退到下一个：
+
+```bash
+-e TG_API_BASE=https://tg.example.com/tg \
+-e TG_PROXY_TOKEN=xxxxxxxx \
+-e 'TG_PROXY_POOLS=[{"apiBase":"https://otterhub-tg-proxy-3uj.pages.dev/tg","proxyToken":"<该代理自己的令牌>"}]'
+```
+
+候选顺序与语义：
+
+| 顺序 | 来源 | 说明 |
+| --- | --- | --- |
+| ① | bot 自带的 `apiBase`（`TG_BOT_POOLS` 里每项可配，支持数组） | 每 bot 独立指定 |
+| ② | `TG_PROXY_POOLS` | 全局共享的额外候选 |
+| ③ | `TG_API_BASE` + `TG_PROXY_TOKEN` | **始终追加**的兜底候选（与前面重复则去重） |
+
+> ③ 这一条容易踩坑：早期版本写的是「只有列表为空才追加全局默认」，结果配了
+> `TG_PROXY_POOLS` 之后 `TG_API_BASE` 里配的主代理被整个丢掉——想「多一个备用」，
+> 实际变成「换掉主用」。现在修成始终追加，日志里可以看到
+> `代理候选数=2 首候选=...`。
+
+语义是**按序主备**，不是轮询分摊：正常请求永远走候选 ①，只有它出现网络错误、
+超时或 5xx 才退到下一个；429（bot 级限流）和 4xx 业务错误不会换代理，
+因为换代理没用（前者交给上层换 bot）。所以**把最快的那个放前面**就行。
+
+启动时会为每个 bot 打印候选，照着核对最省事：
+
+```
+[tg]   槽位 0: chat_id=-1001549117195 代理候选数=2 首候选=https://otterhub-tg-proxy-3uj.pages.dev/tg
+```
+
+回归测试（含「首候选不可达时自动切换且数据一致」「全部候选不可达必须报错」）：
+```bash
+source <容器 TG_*/DAV_* 环境变量> && python3.11 proxy_failover_test.py   # 10/10
+```
 
 ### 多 bot 池的分片分配
 

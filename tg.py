@@ -143,9 +143,9 @@ class TelegramBackend:
         self._slot_lock = threading.Lock()
         self._slot_cursor = 0
         self._proxy_lock = threading.Lock()
-        self._proxy_cursor = {}  # slot idx -> 当前代理候选游标（负载均衡轮询）
-        # 每个槽位的代理候选列表：自带 apiBase 在前，全局 proxy_pools 在后；
-        # 请求级轮询分摊 + 失败自动切换（多个 TG 代理的负载均衡与容灾）
+        # 每个槽位的代理候选列表：自带 apiBase 在前，全局 proxy_pools 在后，
+        # 兜底全局 api_base。语义是「按序主备 + 失败自动切换」：正常永远走候选 0，
+        # 只有它网络/5xx 失败才退到候选 1…（不是轮询分摊，别被早期注释误导）。
         self._candidates = {}
         for i, s in enumerate(self.slots):
             self._candidates[i] = self._build_candidates(s)
@@ -181,8 +181,12 @@ class TelegramBackend:
             cands.append((b.rstrip("/"), tk))
         for (gb, gt) in self.proxy_pools:
             cands.append((gb.rstrip("/"), gt))
-        if not cands:
-            cands.append((self.api_base, self.proxy_token))
+        # 全局默认 api_base 作为兜底候选：必须**始终**追加（去重后）。
+        # 旧写法是 `if not cands: cands.append(api_base)` —— 一旦配了 TG_PROXY_POOLS，
+        # TG_API_BASE 里配的主代理就被整个丢掉：想「多一个备用」结果变成「换掉主用」。
+        fb = (self.api_base.rstrip("/"), self.proxy_token)
+        if fb not in cands:
+            cands.append(fb)
         return cands
 
     def _next_slot(self):
