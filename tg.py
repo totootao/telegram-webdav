@@ -864,8 +864,14 @@ class TelegramBackend:
                                f"(Content-Length 虚高/提前 FIN)")
                         _log(f"iter_chunk 代理候选 {ci} {msg}")
                         raise TGError(msg)
-                    # P1 修复：alive 只有在读完 body 且无异常 + resp 已关闭时才为 True
-                    alive_ok = (not getattr(resp, "will_close", False)) and bool(resp.isclosed())
+                    # P1 修复：alive 只有在读完 body 且无异常 + resp 已关闭时才为 True。
+                    # isclosed() 用安全调用：标准 http.client 响应都有该方法；若响应对象
+                    # 不提供（测试替身/自定义响应），按「body 已读完」处理，不因此中断下载。
+                    try:
+                        resp_closed = bool(resp.isclosed())
+                    except Exception:
+                        resp_closed = True
+                    alive_ok = (not getattr(resp, "will_close", False)) and resp_closed
                     self._release_conn(base, conn, alive_ok)
                     conn = None
                     dt_total = time.time() - t0

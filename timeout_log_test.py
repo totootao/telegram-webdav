@@ -189,10 +189,11 @@ def main():
             raise http.client.ResponseNotReady("模拟代理瞬断")
         return "photos/f.jpg"
 
-    def fake_do_get(api_base, path, proxy_token, rng, timeout=180):
+    def fake_do_get(api_base, path, proxy_token, rng, timeout=180, force_new=False):
         seq = [b"ab", b"cd", b""]
         resp = types.SimpleNamespace(status=200, will_close=False,
-                                     read=lambda n: seq.pop(0) if seq else b"")
+                                     read=lambda n: seq.pop(0) if seq else b"",
+                                     isclosed=lambda: True)
         return (object(), resp)
 
     be._get_file_path = fake_get_file_path

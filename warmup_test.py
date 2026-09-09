@@ -25,7 +25,9 @@ ENV.update({
     "TG_BOT_POOLS": '[{"token":"6052003609:AAHUNBLTtqCEpgMxgMvs8gFXtgdYph8Zj5I","chatId":"-1001549117195"},{"token":"8981700038:AAGDAC819x2_Ozm-Kg8m9GIm0RIP5RJbewI","chatId":"-1001929321614"},{"token":"8912106224:AAEVjCawYULB6agUkBkRCgfF61ZBAQC71MM","chatId":"-1001945524123"},{"token":"8813237599:AAHEDQGxZdHZTWVpSI5TDH_cGuJoqFPNZpk","chatId":"-1001961363514"},{"token":"8998163731:AAE2k2xoqMmld5d1Pf8ko9E8pPwILsZCW8M","chatId":"-1003915360653"}]',
     "DAV_USER": USER, "DAV_PASSWORD": PASS,
     "HOST": "127.0.0.1", "PORT": "10011",
-    "DB_PATH": "/home/docker/data/tg-webdav/telegram_webdav.db",
+    # DB_PATH 可用 WARM_DB 覆盖：默认仍是生产路径；换机器/沙箱跑测试时
+    # 指定 WARM_DB 即可，不必改动脚本（否则会因路径不存在导致服务起不来、请求全 404）。
+    "DB_PATH": os.environ.get("WARM_DB", "/home/docker/data/tg-webdav/telegram_webdav.db"),
 })
 LOG = "/tmp/warm_srv.log"
 AUTH = base64.b64encode(f"{USER}:{PASS}".encode()).decode()
