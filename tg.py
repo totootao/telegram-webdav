@@ -780,11 +780,9 @@ class TelegramBackend:
         cands = self._candidates.get(idx) or [(self.api_base, self.proxy_token)]
         last = None
         t0 = time.time()  # 本分片下载总计时起点（发起 getFile 之前）
-        # P2 修复：期望字节数（Range 切片）或 None（全片）
-        if start is not None and end is not None:
-            expected_total = end - start + 1
-        else:
-            expected_total = None
+        # P2 修复：期望字节数初始值（循环内拿到响应头后会基于 Content-Length 重算，
+        # 这样「无 Range 的整片下载」也能校验代理是否少发字节/CL 虚高）。
+        expected_total = (end - start + 1) if (start is not None and end is not None) else None
         # 标记「已写过字节」：决定后续能否重试/换候选（P0 关键）
         yielded_any = False
 
@@ -808,6 +806,15 @@ class TelegramBackend:
                     # P3 修复：force_new=True 让同代理瞬断重试拿到全新 TCP
                     conn, resp = self._do_get(base, path, proxy_token, rng,
                                                timeout=60, force_new=(attempt > 0))
+                    # P2 修复：拿到响应头后用 Content-Length 重算期望字节数
+                    # （整片下载/无 Range 也能校验「代理静默截断 / CL 虚高」）
+                    if expected_total is None:
+                        _cl = resp.getheader("Content-Length")
+                        if _cl is not None:
+                            try:
+                                expected_total = int(_cl)
+                            except (TypeError, ValueError):
+                                expected_total = None
                     if resp.status >= 400:
                         body = resp.read()
                         try:
