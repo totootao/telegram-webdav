@@ -1200,7 +1200,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                  f"{n_chunks - reused} 片实际上传")
         return head_sample, tail_sample
 
-    def _stream_chunk(self, entry, blk=None):
+    def _stream_chunk(self, entry, blk=None, expected_total=None):
         """边下边发单分片：迭代 backend.iter_chunk 产生的字节块，直接写给客户端。
 
         这是「播放丝滑」的核心：从 Telegram 读到 `blk` 字节就立刻写给客户端一次，
@@ -1210,8 +1210,15 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         ``blk`` 缺省由 ``TG_STREAM_BLOCK_KB`` 决定（默认 256KB）：越小数据到达越平滑、
         起播/seek 首字节越快。
 
+        ``expected_total``（P2/P4 修复传入）：本片应发的总字节数。
+        - 若实际累计 > expected_total：立刻抛 ``_tg.TGError``（多发会污染 keep-alive 下一条响应）
+        - 若实际累计 < expected_total：tg.iter_chunk 已抛错（代理少发/CL 虚高）
+
         完整分片(verify=True)会增量计算 SHA-256 并在分片末尾比对（边发边校验），
         不符立即抛 _IntegrityError 中断连接；Range 切开的片段(verify=False)只转发不校验。
+
+        P4 修复要点：写响应体阶段临时放大 socket 超时，不再让响应体写出和等待下一条请求
+        共用同一个 idle_timeout，避免客户端/中间盒缓冲导致 30s 写出被误判为「客户端断开」。
         返回实际写出的字节数，供收尾日志统计吞吐。
         """
         ci, c, cstart, cend, rs, re_, verify = entry
@@ -1219,37 +1226,69 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         sent = 0
         nblk = 0
         t_first = None
+        # P4 修复：写下响应体的窗口临时放大超时，写完还原。
+        # 用 _BODY_TIMEOUT（默认 300s）兜底，即使客户端慢也不中断；客户端真断由
+        # write 抛 ConnectionError 路径处理。
+        prev_timeout = None
         try:
-            for block in self.app.backend.iter_chunk(
-                c["file_id"], c.get("slot", 0), rs, re_, blk=blk,
-                ctx=getattr(self, "_ctx", None),
-            ):
-                if t_first is None:
-                    t_first = time.time()
-                if h is not None:
-                    h.update(block)
+            try:
+                prev_timeout = self.connection.gettimeout()
+            except Exception:
+                prev_timeout = None
+            try:
+                self.connection.settimeout(self.app.config.body_timeout)
+            except Exception:
+                pass
+
+            try:
+                for block in self.app.backend.iter_chunk(
+                    c["file_id"], c.get("slot", 0), rs, re_, blk=blk,
+                    ctx=getattr(self, "_ctx", None),
+                ):
+                    if t_first is None:
+                        t_first = time.time()
+                    # P2 修复：实际收到的字节数超过本片应发字节数 = tg 池/代理多发了，
+                    # 再写下去就要污染 keep-alive 上的下一条响应。
+                    if expected_total is not None and sent + len(block) > expected_total:
+                        extra = sent + len(block) - expected_total
+                        _log(f"GET 分片[{ci}] 多发字节(中断): 多出 {extra}B "
+                             f"已发={sent} 本片应发={expected_total} block={len(block)}")
+                        raise _tg.TGError(f"分片 {ci} 多发字节: 多出 {extra}B")
+                    if h is not None:
+                        h.update(block)
+                    try:
+                        self.wfile.write(block)
+                        sent += len(block)
+                        nblk += 1
+                    except (ConnectionError, OSError) as e:
+                        # 客户端中途断开：抛出内部信号，让调用方立刻停止（不再等其余分片）
+                        raise _ClientGone(sent) from e
+            except _tg.TGError:
+                raise
+            except _ClientGone:
+                # 客户端主动断开是正常结束信号，必须原样传播——若被下面的兜底捕获并
+                # 转成 TGError，日志会把「客户端提前断开」误报成「下载分片失败」。
+                raise
+            except _IntegrityError:
+                raise
+            except Exception as e:
+                # 兜底：任何非 TGError 的异常（如代理偶发的 http.client.ResponseNotReady）
+                # 都统一转成 TGError，让上层以「干净断连」处理，而不是冒出
+                # 「未捕获异常(返回500)」污染已经发出 206 头的响应体。
+                raise _tg.TGError(f"分片下载异常: {type(e).__name__}: {e}")
+        finally:
+            # 写响应体结束，恢复 idle_timeout 给下一条请求（keep-alive 路径）
+            if prev_timeout is not None:
                 try:
-                    self.wfile.write(block)
-                    sent += len(block)
-                    nblk += 1
-                except (ConnectionError, OSError):
-                    # 客户端中途断开：抛出内部信号，让调用方立刻停止（不再等其余分片）
-                    raise _ClientGone(sent)
-        except _tg.TGError:
-            raise
-        except _ClientGone:
-            # 客户端主动断开是正常结束信号，必须原样传播——若被下面的兜底捕获并
-            # 转成 TGError，日志会把「客户端提前断开」误报成「下载分片失败」。
-            raise
-        except _IntegrityError:
-            raise
-        except Exception as e:
-            # 兜底：任何非 TGError 的异常（如代理偶发的 http.client.ResponseNotReady）
-            # 都统一转成 TGError，让上层以「干净断连」处理，而不是冒出
-            # 「未捕获异常(返回500)」污染已经发出 206 头的响应体。
-            raise _tg.TGError(f"分片下载异常: {type(e).__name__}: {e}")
+                    self.connection.settimeout(self.app.config.idle_timeout)
+                except Exception:
+                    pass
         if h is not None and h.hexdigest() != c.get("sha256"):
             raise _IntegrityError(cstart)
+        # P2 修复：不足预期字节也判错（理论上 tg.iter_chunk 已抛，这里再保险）
+        if expected_total is not None and sent < expected_total:
+            _log(f"GET 分片[{ci}] 少发字节: 已发={sent} 应发={expected_total}")
+            raise _tg.TGError(f"分片 {ci} 少发字节: {sent}/{expected_total}")
         return sent, nblk, t_first
 
     # ---- file_path 预热（不落库版提速）----
@@ -1498,7 +1537,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         try:
             # 首片：始终流式转发（边下边发，让客户端尽快拿到首字节）
             t_dl = time.time()
-            n_first, nblk_first, tfb = self._stream_chunk(first, blk)
+            # P2 修复：传入 expected_total，给写出阶段上下界兜底。
+            # entry 元组顺序：(ci, c, cstart, cend, rs, re_, verify)，索引 4=rs, 5=re_
+            # 首片：re_ - rs + 1（Range 切片或全片）
+            first_expected = (first[5] - first[4] + 1) if first[4] is not None and first[5] is not None else None
+            n_first, nblk_first, tfb = self._stream_chunk(first, blk, expected_total=first_expected)
             dl_t = time.time() - t_dl
             sent += n_first
             tl.append((first[0], dl_t, 0.0, 0.0, n_first))
@@ -1516,8 +1559,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 _kick_prefetch(idx + pf_window)  # 滑动窗口：往前推进预取
                 t_dl = time.time()
                 gap = t_dl - last_done  # 上片写回完 → 本片开始下载之间的间隔（卡顿核心指标）
+                # P2 修复：本片应发字节数
+                # entry 元组：(ci, c, cstart, cend, rs, re_, verify)，索引 4=rs, 5=re_
+                eci, ec, ecstart, ecend, ers, ere, everify = entry
+                exp_total = (ere - ers + 1) if ers is not None and ere is not None else None
                 if stream_all:
-                    n_sent, nblk, tfb = self._stream_chunk(entry, blk)
+                    n_sent, nblk, tfb = self._stream_chunk(entry, blk, expected_total=exp_total)
                     dl_t = time.time() - t_dl
                     tl.append((ci, dl_t, 0.0, gap, n_sent))
                     _log(f"GET 分片[{ci}] 流式完成: 耗时={dl_t:.3f}s 分片间隔={gap:.3f}s "
@@ -1529,6 +1576,14 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     dl_t = time.time() - t_dl
                     if verify and hashlib.sha256(data).hexdigest() != c.get("sha256"):
                         raise _IntegrityError(cstart)
+                    # P2 修复：缓冲写出路径也要把 expected_total 校验做掉
+                    if exp_total is not None and len(data) > exp_total:
+                        extra = len(data) - exp_total
+                        _log(f"GET 分片[{ci}] 多发字节(中断,缓冲路径): 多出 {extra}B")
+                        raise _tg.TGError(f"分片 {ci} 多发字节: 多出 {extra}B")
+                    if exp_total is not None and len(data) < exp_total:
+                        _log(f"GET 分片[{ci}] 少发字节(中断,缓冲路径): {len(data)}/{exp_total}")
+                        raise _tg.TGError(f"分片 {ci} 少发字节: {len(data)}/{exp_total}")
                     t_wr = time.time()
                     try:
                         self.wfile.write(data)
@@ -1561,7 +1616,23 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         finally:
             if pf is not None:
-                pf.shutdown(wait=False)
+                # P4 修复：cancel_futures=True 让 worker 不再继续跑队列剩余的 getFile，
+                # 否则下载结束/客户端 abort 后预取仍会继续打代理数秒-数十秒。
+                try:
+                    pf.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    # 兼容 Python < 3.9 不支持 cancel_futures（项目要求 3.11，这里极少用）
+                    pf.shutdown(wait=False)
+        # P2 修复：总下发字节数必须 == Content-Length，否则强制关连接。
+        # 否则客户端按 Content-Length 继续等、服务端按 idle_timeout 关连接：
+        # 「下载随机停止 + 日志显示 GET 完成」最迷惑人的症状的根因。
+        expected_total_size = end - start + 1
+        if sent != expected_total_size:
+            _log(f"GET 字节数不符(中断连接): path={path} 声明={expected_total_size}B "
+                 f"实际下发={sent}B gap={sent - expected_total_size}B "
+                 f"说明=代理少发/多发/中断，必须关闭连接避免 keep-alive 帧错位")
+            self.close_connection = True
+            return
         dt_total = time.time() - t0
         # 卡顿诊断：相邻分片「写回完→下一片开始下载」的最大间隔；
         # 单线程串行下应≈0，若出现明显尖峰即说明某分片下载/写回异常阻塞。

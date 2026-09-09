@@ -36,6 +36,10 @@ class TGError(Exception):
     pass
 
 
+class _ClientGoneEarly(Exception):
+    """生成器被外部提前终止（客户端断开或流式写入失败）→ 直接停止，不要 yield/不要换候选。"""
+
+
 # 业务型 4xx（换代理无意义，直接抛出交给上层）：429 单独处理（限流，换 bot 重试）
 _BUSINESS_4XX = ("400", "401", "403", "404", "409", "413")
 
@@ -43,6 +47,21 @@ _BUSINESS_4XX = ("400", "401", "403", "404", "409", "413")
 # 避免「大文件里某一个分片短暂抖动就整个下载前功尽弃」。仅在尚未向客户端写出任何字节时
 # 才重试（已写出则不可重试，否则会重复字节污染数据，直接换候选/终止）。
 _CHUNK_RETRY = 3
+
+# P1 修复：连接池条目淘汰上限。代理想 keep-alive 但服务端/中间盒会定时清连接
+# （nginx 默认 60s、Cloudflare ~100s），用 30s 作为安全阈值：超过 30s 没用的连接
+# 一律视为可疑，取出时直接关掉、走新建连接。30s < 常见代理 idle timeout，
+# 既不浪费复用收益，也不捡到「服务端已 FIN」的僵尸连接。
+_CONN_IDLE_MAX = 30.0
+
+# P1 修复：单 host 在池里最多保留多少条 keep-alive 连接。超过就 LRU 关掉最旧那条。
+# 6 条对视频高频 Range 来说已远超实际并发需求（单线程串行下载），更多只会养僵尸。
+_CONN_POOL_MAX = 6
+
+# P3 修复：_do_get 默认总超时（含建连+响应头+响应体）。原本硬编码 180s 等于黑洞场景
+# 必挂死，现在按调用方语义取：getFile 走 30s（接口小响应），分片下载走 30s（默认），
+# 黑洞代理最多阻塞 30s × 重试次数，而不是 18 分钟。
+_DEFAULT_HTTP_TIMEOUT = 30.0
 
 
 def _http_code_of(msg):
@@ -142,7 +161,17 @@ class TelegramBackend:
         self._path_cache_ttl = 50 * 60  # TG file_path 有效期 1h，缓存 50min
         # 连接池：按 (scheme,host,port) 复用 keep-alive 连接，避免视频播放时每个
         # Range 请求都重做 TLS 握手（播放器会高频发 Range，复用连接大幅降低首字节延迟）。
-        self._conn_pool = {}  # key -> collections.deque([conn, ...])
+        #
+        # P1 修复要点：
+        #   - 条目改为 (conn, last_used_ts)，超 _CONN_IDLE_MAX 秒（默认 30）的连接
+        #     在取出时被丢弃，避免 http.client 内部因"上一响应 body 未读完"或
+        #     "服务端已主动 FIN 但 will_close 仍为 False"导致的 ResponseNotReady /
+        #     RemoteDisconnected 连锁自伤；
+        #   - 每 key 容量上限 _CONN_POOL_MAX（默认 6），防止恶意代理不关闭连接把
+        #     池撑爆；满则直接关闭新入队的旧连接；
+        #   - _release_conn 接受显式 alive 标志，仍由调用方在「明确知道 body 已读完
+        #     且无异常」时置 True；其他全部归 False（关闭后丢弃）。
+        self._conn_pool = {}  # key -> collections.deque([(conn, last_used_ts), ...])
         self._conn_lock = threading.Lock()
         self._slot_lock = threading.Lock()
         self._slot_cursor = 0
@@ -251,24 +280,93 @@ class TelegramBackend:
         port = p.port or (443 if scheme == "https" else 80)
         return (scheme, p.hostname, port)
 
-    def _open_conn(self, api_base):
+    def _open_conn(self, api_base, timeout=None):
+        """新建一条（不复用池里任何一条）keep-alive 连接。
+
+        P3 修复：原版硬编码 timeout=180s，导致黑洞代理 + 重试叠加出 18min 挂起。
+        ``timeout`` 形参真正生效；调用方按场景传入（小响应 30、下载分片 30/60、大文件 60/120）。
+        """
         p = urllib.parse.urlparse(api_base or self.api_base)
         scheme = (p.scheme or "https").lower()
         host = p.hostname
         port = p.port or (443 if scheme == "https" else 80)
+        # None 表示用 http.client 默认值；显式传入 >0 才覆盖
+        t = timeout if timeout else _DEFAULT_HTTP_TIMEOUT
         if scheme == "https":
-            return http.client.HTTPSConnection(host, port, timeout=180)
-        return http.client.HTTPConnection(host, port, timeout=180)
+            return http.client.HTTPSConnection(host, port, timeout=t)
+        return http.client.HTTPConnection(host, port, timeout=t)
 
     def _acquire_conn(self, api_base):
+        """从池里取一条还活着的连接，自动淘汰超时/超容。
+
+        P1 修复要点：
+          - 取出时立刻丢弃空闲 > _CONN_IDLE_MAX 秒的条目（防僵尸）；
+          - 容量上限 _CONN_POOL_MAX，超过的最旧一条直接关掉；
+          - 取出时先做一次轻量探活（MSG_PEEK|b"" 即代表已 FIN），死的关掉换下一条。
+        """
         key = self._conn_key(api_base)
+        now = time.time()
         with self._conn_lock:
             dq = self._conn_pool.get(key)
-            if dq:
-                return dq.popleft()
+            if not dq:
+                return None
+            evicted = 0
+            while dq:
+                conn, last_used = dq[0]
+                # 1) 太老了就不要（最坏情况：所有都老，全部清空）
+                if now - last_used > _CONN_IDLE_MAX:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    dq.popleft()
+                    evicted += 1
+                    continue
+                # 2) 拆出最旧的一条（LRU 头），看容量
+                if len(dq) > _CONN_POOL_MAX:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    dq.popleft()
+                    evicted += 1
+                    continue
+                # 3) 探活：MSG_PEEK 读 1 字节，EOF = 已关闭。
+                try:
+                    sock = getattr(conn, "sock", None)
+                    if sock is not None:
+                        import select as _select
+                        rd, _, _ = _select.select([sock], [], [], 0)
+                        if rd:
+                            buf = sock.recv(1, _select.MSG_PEEK)
+                            if not buf:
+                                # 服务端已 FIN，丢弃
+                                try:
+                                    conn.close()
+                                except Exception:
+                                    pass
+                                dq.popleft()
+                                evicted += 1
+                                continue
+                except Exception:
+                    # 探活本身失败 = 连接坏，丢弃
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    dq.popleft()
+                    evicted += 1
+                    continue
+                # 通过校验才用
+                dq.popleft()
+                return conn
+            # 队列空了
+            if evicted:
+                pass  # 之前已经清理过
         return None
 
     def _release_conn(self, api_base, conn, alive):
+        """归还一条连接。alive=False 直接关；alive=True 才入池（带 last_used 时间戳）。"""
         if conn is None:
             return
         if not alive:
@@ -278,20 +376,45 @@ class TelegramBackend:
                 pass
             return
         key = self._conn_key(api_base)
+        now = time.time()
         with self._conn_lock:
-            self._conn_pool.setdefault(key, collections.deque()).append(conn)
+            dq = self._conn_pool.setdefault(key, collections.deque())
+            # 入队前再做一次容量控制：满了就关掉这条（FIFO / LRU 二选一都可，
+            # 这里用 FIFO 简单稳定）。
+            if len(dq) >= _CONN_POOL_MAX:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                return
+            dq.append((conn, now))
 
-    def _do_get(self, api_base, path, proxy_token=None, rng=None, timeout=180):
+    def _do_get(self, api_base, path, proxy_token=None, rng=None, timeout=None,
+                force_new=False):
         """发一次 GET（getFile / 文件字节通用），返回 (conn, resp)。
 
-        连接优先从连接池取（keep-alive 复用）；建连或发送失败自动换一条新连接重试一次。
-        调用方读完整响应体后须用 _release_conn 归还（alive=not resp.will_close）。
+        P3 修复：
+          - ``timeout`` 形参真正生效（之前是死参数，硬编码 180s）；
+          - ``force_new=True`` 时第一次失败后强制走 ``_open_conn`` 而非池，
+            给「同代理瞬断重试」一条真正能拿到新连接的路径。
+        旧行为兼容：``force_new`` 默认 False，行为几乎与原版一致
+        （仍给池一次机会，区别只在 timeout 不再是 180s）。
         """
         last = None
-        for _ in range(2):
-            conn = self._acquire_conn(api_base)
-            if conn is None:
-                conn = self._open_conn(api_base)
+        # 第 1 次：force_new 时直接 _open_conn，否则池优先
+        # 第 2 次：池/新建依 force_new 切换，失败即退出
+        tried = 0
+        while True:
+            tried += 1
+            if force_new and tried == 1:
+                conn = self._open_conn(api_base, timeout=timeout)
+            elif tried >= 2 and force_new:
+                # force_new 路径失败一次后，强制 _open_conn 而不是池（防止僵尸连接）
+                conn = self._open_conn(api_base, timeout=timeout)
+            else:
+                conn = self._acquire_conn(api_base)
+                if conn is None:
+                    conn = self._open_conn(api_base, timeout=timeout)
             headers = {"User-Agent": "TelegramWebDAV/1.0 (+python-urllib)"}
             if proxy_token:
                 headers["Authorization"] = f"Bearer {proxy_token}"
@@ -307,6 +430,9 @@ class TelegramBackend:
                     conn.close()
                 except Exception:
                     pass
+                if tried >= 2:
+                    break
+                # 第 1 次失败，再试一次（无论是 force_new 还是 not，都会换连接尝试）
         raise last or TGError("连接失败")
 
     # ---------- 限流 ----------
@@ -494,12 +620,14 @@ class TelegramBackend:
         _log(f"getFile 请求: file_id={file_id} api={base} "
              f"proxy_auth={'on' if proxy_token else 'off'}")
         for attempt in range(3):
+            conn = None
+            resp = None
             try:
                 conn, resp = self._do_get(base, path, proxy_token, timeout=30)
-                alive = not getattr(resp, "will_close", False)
                 if resp.status != 200:
                     body = resp.read()
                     self._release_conn(base, conn, False)
+                    conn = None
                     _log(f"getFile HTTP 错误: code={resp.status} attempt={attempt + 1}/3 "
                          f"file_id={file_id} body={body[:200]!r}")
                     if resp.status == 429:
@@ -507,7 +635,14 @@ class TelegramBackend:
                         continue
                     raise TGError(f"getFile HTTP {resp.status}: {body[:160]}")
                 raw = resp.read().decode("utf-8", "replace")
+                # P1 修复：读完 body 后再算 alive，并校验 body 已读完
+                # （resp.isclosed() 返回 True 表示 fp 为 None，body 完整读取）。
+                # will_close 反映响应头的声明、isclosed 反映 http.client 状态；
+                # 二者一致才归还池子，否则一律关掉，杜绝"上一响应 body 未读完"
+                # 或"服务端已主动 FIN 但 will_close 仍 False"导致的僵尸连接入库。
+                alive = (not getattr(resp, "will_close", False)) and bool(resp.isclosed())
                 self._release_conn(base, conn, alive)
+                conn = None
                 try:
                     js = json.loads(raw)
                 except json.JSONDecodeError as e:
@@ -528,10 +663,24 @@ class TelegramBackend:
             except (http.client.HTTPException, OSError, socket.timeout) as e:
                 _log(f"getFile 网络/其他错误: {type(e).__name__}: {e} attempt={attempt + 1}/3 "
                      f"file_id={file_id} api={base}")
+                # P1 修复：异常路径显式关连接（即使 resp.read() 已内部关闭了，保险再 close 一次）
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    conn = None
                 if attempt < 2:
                     time.sleep(2)
                     continue
                 raise TGError(f"getFile: {e}")
+            finally:
+                # 兜底：任何漏网路径都关掉连接，绝不让 fd 泄漏到 GC
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
         raise TGError("getFile 失败")
 
     def _get_file_path_direct(self, file_id, token, api_base=None, proxy_token=None):
@@ -611,6 +760,17 @@ class TelegramBackend:
 
         遍历该 bot 的全部代理候选：某代理网络/5xx 失败自动切换下一个；4xx/429 直接抛出。
         连接走 keep-alive 连接池（_do_get/_release_conn），视频高频 Range 下省去重复握手。
+
+        P0/P1/P2 修复要点：
+          - 一旦已 yield 过字节（``total_yield > 0``），本分片下载即视作「不可恢复」：
+            任何后续异常不再换候选重试（否则会重复下发污染客户端/破坏 keep-alive 帧），
+            直接抛 TGError，让 webdav 走「已发部分字节 → 立即中断连接」分支。
+          - ``ok`` 标记：读循环只有正常 break 才置 True，异常路径都置 False，
+            使 finally 把连接关掉而非放回池子，杜绝 zombie 连接。
+          - ``expected_total``：记录本次应下载的字节数（end-start+1，无 Range 则 None），
+            读循环末尾若小于 expected 即视为「代理少发字节（CL 虚高）」，
+            立即抛 TGError（而不是静默结束、日志写「下载完成」）。
+          - alive 判定延后到读完 body 后再算，并校验 ``resp.isclosed()``。
         """
         blk = int(blk or 1024 * 1024)
         n = len(self.slots)
@@ -620,13 +780,20 @@ class TelegramBackend:
         cands = self._candidates.get(idx) or [(self.api_base, self.proxy_token)]
         last = None
         t0 = time.time()  # 本分片下载总计时起点（发起 getFile 之前）
+        # P2 修复：期望字节数（Range 切片）或 None（全片）
+        if start is not None and end is not None:
+            expected_total = end - start + 1
+        else:
+            expected_total = None
+        # 标记「已写过字节」：决定后续能否重试/换候选（P0 关键）
+        yielded_any = False
+
         for ci, (api_base, proxy_token) in enumerate(cands):
             attempt = 0
             while attempt <= _CHUNK_RETRY:
-                # 每次尝试前先归零：except 里要靠它判断「是否已向客户端写出字节」
-                # （未写出才可安全重试）。若只在 try 内赋值，getFile/_do_get 提前抛异常时
-                # except 里访问会触发 UnboundLocalError，把真实错误掩盖成断流。
                 total_yield = 0
+                conn = None
+                resp = None
                 try:
                     fp = self._get_file_path(file_id, token, api_base, proxy_token)
                     base = (api_base or self.api_base).rstrip("/")
@@ -636,12 +803,18 @@ class TelegramBackend:
                     if start is not None:
                         rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
                     _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} path={path} "
-                         f"proxy_auth={'on' if proxy_token else 'off'}")
-                    conn, resp = self._do_get(base, path, proxy_token, rng, timeout=180)
-                    alive = not getattr(resp, "will_close", False)
+                         f"proxy_auth={'on' if proxy_token else 'off'} "
+                         f"expected_total={expected_total}")
+                    # P3 修复：force_new=True 让同代理瞬断重试拿到全新 TCP
+                    conn, resp = self._do_get(base, path, proxy_token, rng,
+                                               timeout=60, force_new=(attempt > 0))
                     if resp.status >= 400:
                         body = resp.read()
-                        self._release_conn(base, conn, False)
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = None
                         msg = f"iter_chunk HTTP {resp.status}: {body[:160]!r}"
                         code = str(resp.status)
                         _log(f"iter_chunk 代理候选 {ci} HTTP {code}: {msg}")
@@ -652,20 +825,42 @@ class TelegramBackend:
                         last = TGError(msg)
                         _log(f"iter_chunk 代理候选 {ci} 失败({msg})，切换下一代理: api={api_base}")
                         break
-                    total_yield = 0
-                    t_first = None  # 首字节到达时刻（TTFB 依据）
+                    t_first = None
                     try:
                         while True:
                             b = resp.read(blk)
                             if not b:
+                                # 可能是正常 EOF，也可能是代理提前 FIN（CL 虚高/提前断流）
+                                # P2 修复：代理常见「Connection: keep-alive + 提前 FIN」
+                                # 二者都会让 resp.read 安静返回 b""，需要在长度层面兜底。
                                 break
                             if t_first is None:
                                 t_first = time.time()
                             total_yield += len(b)
                             yield b
-                    finally:
-                        # 读完整响应体后才归还连接，保证 keep-alive 连接可安全复用
-                        self._release_conn(base, conn, alive)
+                    except (GeneratorExit, _ClientGoneEarly):
+                        # P0 修复：生成器被显式关闭（_stream_chunk 客户端断开抛 _ClientGone）
+                        # 或被外层提前终止。不再 yield、不再换候选；连接对象弃用。
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        return
+                    # P2 修复：读完循环末尾若不足 expected_total，判静默截断，抛错而非 return
+                    if expected_total is not None and total_yield < expected_total:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = None
+                        msg = (f"代理少发字节: 期望={expected_total}B 实际={total_yield}B "
+                               f"(Content-Length 虚高/提前 FIN)")
+                        _log(f"iter_chunk 代理候选 {ci} {msg}")
+                        raise TGError(msg)
+                    # P1 修复：alive 只有在读完 body 且无异常 + resp 已关闭时才为 True
+                    alive_ok = (not getattr(resp, "will_close", False)) and bool(resp.isclosed())
+                    self._release_conn(base, conn, alive_ok)
+                    conn = None
                     dt_total = time.time() - t0
                     dt_first = (t_first - t0) if t_first is not None else dt_total
                     _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield} "
@@ -674,14 +869,22 @@ class TelegramBackend:
                          f"proxy={api_base}")
                     return
                 except TGError:
+                    # 把 tg 自己的错误原样上抛（不重试、不换候选）；连接由 finally 关掉
                     raise
+                except _ClientGoneEarly:
+                    # 客户端主动关：算正常结束
+                    return
                 except (http.client.HTTPException, OSError, socket.timeout) as e:
                     last = e
-                    # 已向客户端写出任何字节则不可重试（会重复字节污染数据），直接换下一候选
+                    # P0 修复：已 yield 过字节 → 不再换候选、不再重试，直接上抛。
+                    # 旧逻辑「break 到外层 for 换候选」会让下游在已写 N 字节后又从头
+                    # yield 整片，超出 Content-Length → 污染客户端 / 错位 keep-alive。
                     if total_yield > 0:
-                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,不重试): "
-                             f"{type(e).__name__}: {e} api={api_base}")
-                        break
+                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,"
+                             f"不再换候选/重试): {type(e).__name__}: {e} api={api_base}")
+                        raise TGError(f"下载分片中断(已写 {total_yield}B): "
+                                      f"{type(e).__name__}: {e}")
+                    # 未写出字节：可重试或换候选
                     if attempt < _CHUNK_RETRY:
                         attempt += 1
                         if ctx is not None:
@@ -699,9 +902,10 @@ class TelegramBackend:
                 except Exception as e:
                     last = e
                     if total_yield > 0:
-                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,不重试): "
-                             f"{type(e).__name__}: {e} api={api_base}")
-                        break
+                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,"
+                             f"不再换候选/重试): {type(e).__name__}: {e} api={api_base}")
+                        raise TGError(f"下载分片中断(已写 {total_yield}B): "
+                                      f"{type(e).__name__}: {e}")
                     if attempt < _CHUNK_RETRY:
                         attempt += 1
                         if ctx is not None:
@@ -716,7 +920,14 @@ class TelegramBackend:
                     _log(f"iter_chunk 代理候选 {ci} 网络/其他错误: {type(e).__name__}: {e} "
                          f"api={api_base}")
                     break
-            # 该代理候选重试耗尽，继续尝试下一个候选（若有）
+                finally:
+                    # 兜底：任何漏掉的路径都关连接，杜绝 fd 泄漏与 zombie 入池
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+            # 该代理候选重试耗尽，未写出字节 → 继续尝试下一个候选（若有）
             continue
         # 所有候选与重试均失败：统一抛 TGError（绝不直接抛裸的 http.client 异常，
         # 否则 webdav 流式下发的 except _tg.TGError 捕获不到，会变成「未捕获异常(返回500)」
