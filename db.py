@@ -111,6 +111,33 @@ class MetaStore:
                 )
                 """
             )
+            # 分片去重表（内容寻址）：按分片的 SHA-256 记录「已上传到 Telegram 的分片」。
+            #
+            # 为什么需要它：大文件（如 1.2GB=60 片）上传时，只要有一个分片最终失败，
+            # 服务端就返回 502，标准 WebDAV 客户端只能**重传整个文件**——那 59 片已成功
+            # 上传的字节就白传了，还会在频道里留下一堆孤儿消息。
+            # 有了这张表，客户端重传同一文件时，服务端按分片 SHA 查到「这片传过了」，
+            # 直接复用原 file_id 跳过上传，**只真正补传失败的那几片**——客户端行为不变，
+            # 实际上传量从 1.2GB 降到几十 MB，且不再产生重复消息。
+            #
+            # 注意：file_id 与 bot 绑定，故必须连 slot 一起记录；分片内容相同即可复用，
+            # 因此这是**跨文件**的去重（不同文件中的相同数据块也能省一次上传）。
+            # 仅适用于自有/可信频道场景（复用依赖内容哈希可查）。
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS chunk_dedup (
+                    sha        TEXT PRIMARY KEY,
+                    file_id    TEXT NOT NULL,
+                    slot       INTEGER NOT NULL,
+                    message_id INTEGER,
+                    size       INTEGER NOT NULL,
+                    created    REAL NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chunk_dedup_created ON chunk_dedup(created)"
+            )
             now = int(time.time())
             self._conn.execute(
                 "INSERT OR IGNORE INTO nodes(path,name,is_dir,size,mtime,ctime,etag) "
@@ -304,3 +331,43 @@ class MetaStore:
         with self._lock:
             self._conn.execute("DELETE FROM locks WHERE expiry < ?", (int(time.time()),))
             self._conn.commit()
+
+    # ---------- 分片去重（大文件重传时复用已上传分片）----------
+    def find_chunk_by_sha(self, sha, size=None):
+        """按分片 SHA-256 查已上传过的分片，命中返回 (file_id, slot, message_id)，否则 None。
+
+        命中即意味着：这个分片的内容已经在 Telegram 里了，可以直接复用 file_id，
+        不必重新上传——大文件重传时靠它做到「只补传失败的那几片」。
+        """
+        with self._lock:
+            if size is None:
+                row = self._conn.execute(
+                    "SELECT file_id, slot, message_id FROM chunk_dedup WHERE sha=?",
+                    (sha,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT file_id, slot, message_id FROM chunk_dedup WHERE sha=? AND size=?",
+                    (sha, size),
+                ).fetchone()
+            return (row[0], row[1], row[2]) if row else None
+
+    def put_chunk_dedup(self, sha, file_id, slot, message_id, size):
+        """记录一个已上传分片的 file_id（同一 sha 重复写入直接忽略，保留首次记录）。"""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO chunk_dedup(sha,file_id,slot,message_id,size,created) "
+                "VALUES(?,?,?,?,?,?)",
+                (sha, file_id, slot, message_id, size, time.time()),
+            )
+            self._conn.commit()
+
+    def purge_expired_chunks(self, ttl_seconds):
+        """清掉超过 TTL 的分片去重记录，避免表无限增长（默认 30 天）。"""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM chunk_dedup WHERE created < ?", (time.time() - ttl_seconds,)
+            )
+            n = cur.rowcount
+            self._conn.commit()
+            return n

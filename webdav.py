@@ -143,6 +143,31 @@ _MEDIA_TAIL_SAMPLE = 4 * 1024 * 1024
 # 旧路径对 1.2GB 文件的实测内存峰值是 2743MB（2.27 倍），2GB 文件足以撑爆普通容器。
 _STREAM_UPLOAD_MIN_BYTES = 32 * 1024 * 1024
 
+# 单个分片上传失败后，在 webdav 层重试的次数。
+#
+# 为什么需要它（大文件上传的核心痛点）：一个 1.2GB 文件会被切成 60 个分片，
+# 若「任一分片失败就整体放弃」，设单分片失败率 1%，整体成功率仅 0.99^60≈55%——
+# 也就是近一半概率白传。分片越多越容易挂，这正是大文件尤其容易失败的原因。
+# 这里让**失败的那一片自己重试**（换 bot 槽位 + 退避），其余分片照常成功，
+# 整体成功率随之回到 ~99%+，且不会产生「一片失败拖垮全部」的连锁反应。
+# 注意：upload_chunk 内部已有「换槽位 + 3 次退避」的快速重试，这里是最后防线，
+# 退避更长，用于扛住持续性限流/较长时间的网络抖动。
+_UP_CHUNK_RETRY = 3
+# 分片去重记录在库里的保留时长（秒）：默认 30 天，避免去重表无限增长。
+_CHUNK_DEDUP_TTL = 30 * 24 * 3600
+
+
+def _up_backoff(attempt, msg):
+    """分片上传重试的退避秒数。
+
+    429 限流优先用 Telegram 返回的 retry_after（等够时间再试，否则必然再撞限流）；
+    其他错误走指数退避，上限 30s，避免长时间抖动时把请求打爆。
+    """
+    m = re.search(r"retry_after\D*(\d+)", msg or "")
+    if m:
+        return max(1, min(60, int(m.group(1))))
+    return min(30, 2 ** attempt)
+
 
 class _IntegrityError(Exception):
     """下载分片时检测到内容完整性被破坏（哈希不符或被截断）。
@@ -756,18 +781,45 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         total = len(body_data)
         n_chunks = (total + chunk_size - 1) // chunk_size
         workers = self.app.config._upload_workers(len(self.app.backend.slots))
-        _log(f"PUT 并发上传启动: 分片数={n_chunks} 并发线程={workers}")
+        dedup_on = getattr(self.app.config, "chunk_dedup", True)
+        _log(f"PUT 并发上传启动: 分片数={n_chunks} 并发线程={workers} "
+             f"分片去重={'on' if dedup_on else 'off'}")
 
         def _one(ci, buf):
             chunk_sha = hashlib.sha256(buf).hexdigest()
+            # 去重：这片内容若已上传过，直接复用原 file_id，跳过本次上传。
+            # 大文件重传时靠它做到「只补传失败的那几片」。
+            if dedup_on:
+                hit = self.app.db.find_chunk_by_sha(chunk_sha, len(buf))
+                if hit:
+                    fid, slot, mid = hit
+                    _log(f"PUT 分片[{ci}] 命中去重(跳过上传): size={len(buf)}B "
+                         f"slot={slot} file_id={fid}")
+                    return ci, fid, slot, mid, chunk_sha, buf, True
             chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
             fid, slot, mid = self.app.backend.upload_chunk(buf, file_name=chunk_name)
-            return ci, fid, slot, mid, chunk_sha, buf
+            if dedup_on:
+                self.app.db.put_chunk_dedup(chunk_sha, fid, slot, mid, len(buf))
+            return ci, fid, slot, mid, chunk_sha, buf, False
+
+        def _one_retry(ci, buf):
+            """上传单分片，失败只重试这一片（不牵连其他分片），重试耗尽才抛出。"""
+            last = None
+            for attempt in range(_UP_CHUNK_RETRY + 1):
+                try:
+                    return _one(ci, buf)
+                except _tg.TGError as e:
+                    last = e
+                    if attempt >= _UP_CHUNK_RETRY:
+                        break
+                    _log(f"PUT 分片[{ci}] 上传失败，重试({attempt + 1}/{_UP_CHUNK_RETRY}): {e}")
+                    time.sleep(_up_backoff(attempt, str(e)))
+            raise last
 
         results = [None] * n_chunks
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             fut_map = {
-                ex.submit(_one, i, body_data[i * chunk_size:(i + 1) * chunk_size]): i
+                ex.submit(_one_retry, i, body_data[i * chunk_size:(i + 1) * chunk_size]): i
                 for i in range(n_chunks)
             }
             for fut in concurrent.futures.as_completed(fut_map):
@@ -775,17 +827,29 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 try:
                     results[i] = fut.result()
                 except _tg.TGError as e:
-                    for f2 in fut_map.values():
+                    # 该分片重试已耗尽，整体失败：取消尚未开始的任务，避免无谓的上传。
+                    # 注意 fut_map 的 key 才是 Future（value 是分片索引），
+                    # 早期版本误用 fut_map.values() 去 .cancel()，实际是在对 int 调用，
+                    # 会抛 AttributeError 并掩盖真正的失败原因（429/网络错误）。
+                    for f2 in fut_map:
                         f2.cancel()
+                    _log(f"PUT 分片[{i}] 重试 {_UP_CHUNK_RETRY} 次后仍失败，"
+                         f"已取消其余未开始任务: {e}")
                     raise
         # 按序组装：整文件哈希 + 分片元信息（带 _buf 供调用方取 head/tail 采样，落库前清除）
+        reused = 0
         for res in results:
-            _, fid, slot, mid, chunk_sha, buf = res
+            _, fid, slot, mid, chunk_sha, buf, hit = res
+            if hit:
+                reused += 1
             file_hash.update(buf)
             chunks_meta.append({
                 "file_id": fid, "slot": slot, "size": len(buf),
                 "message_id": mid, "sha256": chunk_sha, "_buf": buf,
             })
+        if reused:
+            _log(f"PUT 分片复用统计: 共 {n_chunks} 片，其中 {reused} 片命中去重直接复用，"
+                 f"{n_chunks - reused} 片实际上传")
 
     def _upload_streaming(self, body_iter, total, orig_name, multi, chunk_size,
                           chunks_meta, file_hash, head_sample_size, tail_sample_size):
@@ -808,8 +872,10 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         n_chunks = (total + chunk_size - 1) // chunk_size if total > 0 else 0
         workers = self.app.config._upload_workers(len(self.app.backend.slots))
         max_inflight = max(2, workers * 2)
+        dedup_on = getattr(self.app.config, "chunk_dedup", True)
         _log(f"PUT 流式上传启动: 分片数={n_chunks} 并发线程={workers} "
              f"在飞上限={max_inflight} 分片大小={chunk_size // 1024 // 1024}MB "
+             f"分片重试={_UP_CHUNK_RETRY} 分片去重={'on' if dedup_on else 'off'} "
              f"(内存占用≈在飞分片数×分片大小,与文件大小无关)")
 
         results = [None] * n_chunks
@@ -819,16 +885,41 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         def _one(ci, buf):
             chunk_sha = hashlib.sha256(buf).hexdigest()
+            # 去重：这片内容若已上传过，直接复用原 file_id，跳过本次上传。
+            # 1.2GB 重传时 60 片里 59 片命中 → 实际只补传失败那 1 片。
+            if dedup_on:
+                hit = self.app.db.find_chunk_by_sha(chunk_sha, len(buf))
+                if hit:
+                    fid, slot, mid = hit
+                    _log(f"PUT 分片[{ci}] 命中去重(跳过上传): size={len(buf)}B "
+                         f"slot={slot} file_id={fid}")
+                    return ci, fid, slot, mid, chunk_sha, buf, True
             chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
             fid, slot, mid = self.app.backend.upload_chunk(buf, file_name=chunk_name)
-            return ci, fid, slot, mid, chunk_sha, buf
+            if dedup_on:
+                self.app.db.put_chunk_dedup(chunk_sha, fid, slot, mid, len(buf))
+            return ci, fid, slot, mid, chunk_sha, buf, False
+
+        def _one_retry(ci, buf):
+            """上传单分片，失败只重试这一片（不牵连其他分片），重试耗尽才抛出。"""
+            last = None
+            for attempt in range(_UP_CHUNK_RETRY + 1):
+                try:
+                    return _one(ci, buf)
+                except _tg.TGError as e:
+                    last = e
+                    if attempt >= _UP_CHUNK_RETRY:
+                        break
+                    _log(f"PUT 分片[{ci}] 上传失败，重试({attempt + 1}/{_UP_CHUNK_RETRY}): {e}")
+                    time.sleep(_up_backoff(attempt, str(e)))
+            raise last
 
         def _harvest(done_futs):
             """回收已完成的任务；任一分片失败即抛出。"""
             nonlocal tail_sample
             for fut in done_futs:
-                ci, fid, slot, mid, chunk_sha, buf = fut.result()
-                results[ci] = (ci, fid, slot, mid, chunk_sha, len(buf))
+                ci, fid, slot, mid, chunk_sha, buf, hit = fut.result()
+                results[ci] = (ci, fid, slot, mid, chunk_sha, len(buf), hit)
                 if ci == n_chunks - 1:
                     tail_sample = buf[-tail_sample_size:]
                 del pending[fut]
@@ -844,7 +935,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     file_hash.update(piece)          # 顺序：整文件哈希与整算一致
                     if ci == 0:
                         head_sample = piece[:head_sample_size]
-                    pending[ex.submit(_one, ci, piece)] = ci
+                    pending[ex.submit(_one_retry, ci, piece)] = ci
                     ci += 1
                     if len(pending) >= max_inflight:
                         done, _ = concurrent.futures.wait(
@@ -855,19 +946,25 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 file_hash.update(piece)
                 if ci == 0:
                     head_sample = piece[:head_sample_size]
-                pending[ex.submit(_one, ci, piece)] = ci
+                pending[ex.submit(_one_retry, ci, piece)] = ci
                 ci += 1
             for fut in concurrent.futures.as_completed(list(pending)):
                 _harvest([fut])
 
+        reused = 0
         for res in results:
             if res is None:
                 raise _tg.TGError(f"分片 {len(chunks_meta)} 未上传成功")
-            _, fid, slot, mid, chunk_sha, size = res
+            _, fid, slot, mid, chunk_sha, size, hit = res
+            if hit:
+                reused += 1
             chunks_meta.append({
                 "file_id": fid, "slot": slot, "size": size,
                 "message_id": mid, "sha256": chunk_sha,
             })
+        if reused:
+            _log(f"PUT 分片复用统计: 共 {n_chunks} 片，其中 {reused} 片命中去重直接复用，"
+                 f"{n_chunks - reused} 片实际上传")
         return head_sample, tail_sample
 
     def _stream_chunk(self, entry, blk=None):
@@ -905,6 +1002,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     # 客户端中途断开：抛出内部信号，让调用方立刻停止（不再等其余分片）
                     raise _ClientGone(sent)
         except _tg.TGError:
+            raise
+        except _ClientGone:
+            # 客户端主动断开是正常结束信号，必须原样传播——若被下面的兜底捕获并
+            # 转成 TGError，日志会把「客户端提前断开」误报成「下载分片失败」。
+            raise
+        except _IntegrityError:
             raise
         except Exception as e:
             # 兜底：任何非 TGError 的异常（如代理偶发的 http.client.ResponseNotReady）

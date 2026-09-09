@@ -604,6 +604,10 @@ class TelegramBackend:
         for ci, (api_base, proxy_token) in enumerate(cands):
             attempt = 0
             while attempt <= _CHUNK_RETRY:
+                # 每次尝试前先归零：except 里要靠它判断「是否已向客户端写出字节」
+                # （未写出才可安全重试）。若只在 try 内赋值，getFile/_do_get 提前抛异常时
+                # except 里访问会触发 UnboundLocalError，把真实错误掩盖成断流。
+                total_yield = 0
                 try:
                     fp = self._get_file_path(file_id, token, api_base, proxy_token)
                     base = (api_base or self.api_base).rstrip("/")
