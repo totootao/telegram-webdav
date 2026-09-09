@@ -249,7 +249,8 @@ with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROD_REPORT.
     f.write(f"- 结论：**{passed}/{total_n} 通过**\n\n")
     f.write("## 真实性能\n\n")
     f.write("| 指标 | 数值 |\n|---|---|\n")
-    f.write(f"| 上传 {BIG_MB}MB | {dt_put:.2f}s ({BIG_MB/dt_put:.2f} MB/s) |\n")
+    _put_spd = f"{BIG_MB/dt_put:.2f} MB/s" if dt_put else "-"
+    f.write(f"| 上传 {BIG_MB}MB | {dt_put:.2f}s ({_put_spd}) |\n")
     f.write(f"| 全量下载 | {m_full['dur']:.2f}s ({m_full['thr']:.2f} MB/s) |\n")
     f.write(f"| 起播吞吐 | {m_play['thr']:.2f} MB/s |\n")
     f.write(f"| seek 吞吐 | {m_seek['thr']:.2f} MB/s |\n")

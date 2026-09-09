@@ -1,6 +1,6 @@
 # 真实场景测试报告
 
-- 测试时间：2026-09-08 22:20:02
+- 测试时间：2026-09-09 09:02:07
 - 单分片人为延迟：`0.15s`（模拟真实 Telegram / 自建代理单分片下载耗时）
 - 分片大小：`20MB`
 - 下载模式：**单线程串行**（首片边下边发，其余分片主线程依次下载→校验→回写）
@@ -20,7 +20,7 @@
 
 | 用例 | 结果 | 说明 |
 |---|---|---|
-| put.big.multi_chunk | PASS | status=201 chunks=5 put=4.50s |
+| put.big.multi_chunk | PASS | status=201 chunks=5 put=4.08s |
 | get.big.full(200) | PASS | status=200 |
 | get.big.bytes_identical | PASS | len=104857600 expect=104857600 |
 | get.big.sha256_identical | PASS |  |
@@ -30,8 +30,8 @@
 | get.range.tail(206) | PASS | status=206 len=2097152 |
 | get.big2.full(200) | PASS | status=200 len=167772160 |
 | get.big2.max_gap_low | PASS | max_gap=0.0s (8分片串行,应≈0) |
-| concurrent.diff_files.all_200_and_identical | PASS | errors={} ok=4/4 wall=0.74s |
-| concurrent.parallelism_preserved | PASS | wall=0.74s 单文件基准≈0.45s (4路并发墙钟应接近单文件基准,证明服务端层并发未被串行化) |
+| concurrent.diff_files.all_200_and_identical | PASS | errors={} ok=4/4 wall=0.56s |
+| concurrent.parallelism_preserved | PASS | wall=0.56s 单文件基准≈0.45s (4路并发墙钟应接近单文件基准,证明服务端层并发未被串行化) |
 | concurrent.same_file_ranges.all_206 | PASS | errors={} ok=4/4 |
 | client.half_disconnect | PASS | got=52428800 half=52428800 |
 | resume.from_half(206_identical) | PASS | status=206 len=52428800 |

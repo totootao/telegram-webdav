@@ -139,6 +139,9 @@ _RESIDUAL_LIMIT = 4096
 # tail 给得比 head 大，是因为 MP4 未做 faststart 时 moov 落在文件尾且可能较大。
 _MEDIA_HEAD_SAMPLE = 512 * 1024
 _MEDIA_TAIL_SAMPLE = 4 * 1024 * 1024
+# 上传走「流式边收边传」的大小门槛：超过它就不把整个请求体读进内存。
+# 旧路径对 1.2GB 文件的实测内存峰值是 2743MB（2.27 倍），2GB 文件足以撑爆普通容器。
+_STREAM_UPLOAD_MIN_BYTES = 32 * 1024 * 1024
 
 
 class _IntegrityError(Exception):
@@ -343,6 +346,35 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     # ---------------- 请求体读取与残包检测 ----------------
+    def _iter_body_exact(self, n, blk=1024 * 1024):
+        """按 n 字节流式读取请求体的生成器（带超时保护，记账到 ``_body_read``）。
+
+        与 ``_read_exact`` 的区别：不把 n 字节攒在内存里返回，而是读一块 yield 一块，
+        供流式上传边收边传——1GB 文件不再需要 1GB 的服务端内存。
+        """
+        if n <= 0:
+            return
+        orig = None
+        try:
+            orig = self.connection.gettimeout()
+            self.connection.settimeout(self._read_timeout)
+        except Exception:
+            pass
+        left = n
+        try:
+            while left > 0:
+                chunk = self.rfile.read(min(left, blk))
+                if not chunk:
+                    break  # 客户端断开或提前结束
+                left -= len(chunk)
+                self._body_read += len(chunk)
+                yield chunk
+        finally:
+            try:
+                self.connection.settimeout(orig)
+            except Exception:
+                pass
+
     def _read_exact(self, n):
         """读取恰好 n 字节（带超时保护），并记账到 ``_body_read``。"""
         buf = bytearray()
@@ -755,6 +787,89 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 "message_id": mid, "sha256": chunk_sha, "_buf": buf,
             })
 
+    def _upload_streaming(self, body_iter, total, orig_name, multi, chunk_size,
+                          chunks_meta, file_hash, head_sample_size, tail_sample_size):
+        """边收边传：从 ``body_iter`` 流式取字节，攒满一片就交给线程池上传。
+
+        为什么需要它（1GB+ 文件的硬伤）：
+          旧路径先 ``_read_exact`` 把整个文件读进内存（1.2GB → 1.2GB），
+          ``_upload_parallel`` 再按分片切片（又一份 1.2GB），实测 1.2GB 上传
+          服务端内存峰值 **2743MB ≈ 文件大小的 2.27 倍**。2GB 文件就是 ~4.5GB，
+          普通 1~2GB 内存的容器直接 OOM。
+
+        现在内存占用 ≈ 在飞分片数 × 分片大小（默认 2×5×20MB ≈ 200MB），与文件大小无关。
+
+        关键点：
+        - 顺序读取 → 整文件 SHA-256 在提交前按序 update，结果与整文件计算一致
+        - head/tail 采样：只保留首片头 512KB 与末片尾 4MB，不保留全部分片数据
+        - 在飞分片数上限 = 2 × 并发数，防止 TG 上传慢、客户端快时内存堆积
+        - 任一分片失败立即取消剩余任务并抛出，由调用方回 502
+        """
+        n_chunks = (total + chunk_size - 1) // chunk_size if total > 0 else 0
+        workers = self.app.config._upload_workers(len(self.app.backend.slots))
+        max_inflight = max(2, workers * 2)
+        _log(f"PUT 流式上传启动: 分片数={n_chunks} 并发线程={workers} "
+             f"在飞上限={max_inflight} 分片大小={chunk_size // 1024 // 1024}MB "
+             f"(内存占用≈在飞分片数×分片大小,与文件大小无关)")
+
+        results = [None] * n_chunks
+        head_sample = b""
+        tail_sample = b""
+        pending = {}
+
+        def _one(ci, buf):
+            chunk_sha = hashlib.sha256(buf).hexdigest()
+            chunk_name = orig_name if not multi else f"{orig_name}.part{ci:03d}"
+            fid, slot, mid = self.app.backend.upload_chunk(buf, file_name=chunk_name)
+            return ci, fid, slot, mid, chunk_sha, buf
+
+        def _harvest(done_futs):
+            """回收已完成的任务；任一分片失败即抛出。"""
+            nonlocal tail_sample
+            for fut in done_futs:
+                ci, fid, slot, mid, chunk_sha, buf = fut.result()
+                results[ci] = (ci, fid, slot, mid, chunk_sha, len(buf))
+                if ci == n_chunks - 1:
+                    tail_sample = buf[-tail_sample_size:]
+                del pending[fut]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+            ci = 0
+            buf = bytearray()
+            for block in body_iter:
+                buf += block
+                while len(buf) >= chunk_size and ci < n_chunks:
+                    piece = bytes(buf[:chunk_size])
+                    del buf[:chunk_size]
+                    file_hash.update(piece)          # 顺序：整文件哈希与整算一致
+                    if ci == 0:
+                        head_sample = piece[:head_sample_size]
+                    pending[ex.submit(_one, ci, piece)] = ci
+                    ci += 1
+                    if len(pending) >= max_inflight:
+                        done, _ = concurrent.futures.wait(
+                            pending, return_when=concurrent.futures.FIRST_COMPLETED)
+                        _harvest(done)
+            if ci < n_chunks and buf:                # 最后一片（不足 chunk_size）
+                piece = bytes(buf)
+                file_hash.update(piece)
+                if ci == 0:
+                    head_sample = piece[:head_sample_size]
+                pending[ex.submit(_one, ci, piece)] = ci
+                ci += 1
+            for fut in concurrent.futures.as_completed(list(pending)):
+                _harvest([fut])
+
+        for res in results:
+            if res is None:
+                raise _tg.TGError(f"分片 {len(chunks_meta)} 未上传成功")
+            _, fid, slot, mid, chunk_sha, size = res
+            chunks_meta.append({
+                "file_id": fid, "slot": slot, "size": size,
+                "message_id": mid, "sha256": chunk_sha,
+            })
+        return head_sample, tail_sample
+
     def _stream_chunk(self, entry, blk=None):
         """边下边发单分片：迭代 backend.iter_chunk 产生的字节块，直接写给客户端。
 
@@ -791,6 +906,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     raise _ClientGone(sent)
         except _tg.TGError:
             raise
+        except Exception as e:
+            # 兜底：任何非 TGError 的异常（如代理偶发的 http.client.ResponseNotReady）
+            # 都统一转成 TGError，让上层以「干净断连」处理，而不是冒出
+            # 「未捕获异常(返回500)」污染已经发出 206 头的响应体。
+            raise _tg.TGError(f"分片下载异常: {type(e).__name__}: {e}")
         if h is not None and h.hexdigest() != c.get("sha256"):
             raise _IntegrityError(cstart)
         return sent, nblk, t_first
@@ -816,6 +936,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             _WARM_ACTIVE += 1
 
         def _run():
+            global _WARM_ACTIVE
             try:
                 self.app.backend.prefetch_paths(items)
             except Exception as e:
@@ -999,18 +1120,40 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         tl = []  # (ci, 下载耗时, 写回耗时, 分片间隔, 字节数)
         last_done = time.time()  # 上一片处理完（写回客户端）的时刻
 
-        # 真实环境优化：首片开始下载的同时，后台并发预取其余分片的 file_path。
-        # 一次 getFile 可能要 2~4s（自建代理 RTT），串行下载时每片都要干等一次；
-        # 预取把这段 RTT 完全藏进首片的下载时间里，轮到后续分片时缓存已热。
-        # 失败也不影响——iter_chunk 内部会自动回退到常规 getFile。
+        # 真实环境优化：后台并发预取后续分片的 file_path，把 getFile 的 RTT 藏进下载时间里。
+        #
+        # 【踩过的坑】早期版本一次性把**全部** rest 分片丢去预取：60 分片的文件会瞬间发起
+        # 59 个 getFile（8 路并发持续十几秒），把自建代理打满，getFile 从 0.7s 恶化到
+        # 2.7~14.8s，连首片自己的 getFile 都被拖到 13s，TTFB 直接 13.959s——得不偿失。
+        #
+        # 改为**滑动窗口**：始终只预取「接下来 window 片」，处理完一片就往前推进一格。
+        # 并发 getFile 始终 ≤ window，既消除了后续分片的等待，又不干扰首片的首字节。
         pf = None
+        pf_window = max(1, int(getattr(self.app.config, "prefetch_window", 3)))
+        pf_submitted = set()
+
+        def _kick_prefetch(from_idx):
+            """预取 plan[from_idx : from_idx+window] 中尚未提交过的分片。"""
+            if pf is None:
+                return
+            items = []
+            for e in plan[from_idx: from_idx + pf_window]:
+                fid = e[1]["file_id"]
+                if fid in pf_submitted:
+                    continue
+                pf_submitted.add(fid)
+                items.append((fid, e[1].get("slot", 0)))
+            if items:
+                try:
+                    pf.submit(self.app.backend.prefetch_paths, items)
+                except Exception:
+                    pass
+
         if rest and hasattr(self.app.backend, "prefetch_paths"):
             try:
+                # 单线程 executor：保证同一时刻只有一批（≤window 个）getFile 在飞
                 pf = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-                pf_fut = pf.submit(
-                    self.app.backend.prefetch_paths,
-                    [(c["file_id"], c.get("slot", 0)) for _, c, _, _, _, _, _ in rest],
-                )
+                _kick_prefetch(1)
             except Exception:
                 pf = None
 
@@ -1026,18 +1169,13 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                  f"吞吐={_fmt_speed_local(n_first, dl_t)} "
                  f"首字节延迟={(tfb - t_dl):.3f}s(本片内) TTFB={(tfb - t0):.3f}s(自请求起)")
             last_done = time.time()
-            # 首片已开始下发，此时其余分片的 file_path 应已预取完（通常远快于首片下载）
-            if pf is not None:
-                try:
-                    pf_fut.result(timeout=120)
-                except Exception as e:
-                    _log(f"file_path 预取异常(忽略): {type(e).__name__}: {e}")
-                finally:
-                    pf.shutdown(wait=False)
+            # 首片已下发，预取由滑动窗口继续推进，不再阻塞等待
+            # （预取失败也能正常下载，只是慢一点：iter_chunk 会自动回退到常规 getFile）
             # 其余分片：默认同样流式下发（播放丝滑的关键）；
             # 仅在 TG_STREAM_ALL_CHUNKS=off 时退回「整片缓冲后一次性写出」的旧行为。
-            for entry in rest:
+            for idx, entry in enumerate(rest, start=1):
                 ci, c, cstart, cend, rs, re_, verify = entry
+                _kick_prefetch(idx + pf_window)  # 滑动窗口：往前推进预取
                 t_dl = time.time()
                 gap = t_dl - last_done  # 上片写回完 → 本片开始下载之间的间隔（卡顿核心指标）
                 if stream_all:
@@ -1083,6 +1221,9 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             _log(f"GET 下载分片失败(连接中断): path={path} 错误={e} 已发={_fmt_size(sent)}")
             self.close_connection = True
             return
+        finally:
+            if pf is not None:
+                pf.shutdown(wait=False)
         dt_total = time.time() - t0
         # 卡顿诊断：相邻分片「写回完→下一片开始下载」的最大间隔；
         # 单线程串行下应≈0，若出现明显尖峰即说明某分片下载/写回异常阻塞。
@@ -1145,12 +1286,18 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         # 否则 total=0 导致 while 循环不执行、文件数据静默丢失（创建空文件）。
         te = (self.headers.get("Transfer-Encoding") or "").strip().lower()
         cl_hdr = self.headers.get("Content-Length")
-        if cl_hdr is not None:
-            total = int(cl_hdr) or 0
-            # 有 Content-Length：按精确长度读取
+        total = int(cl_hdr) if cl_hdr is not None else 0
+        # 有 Content-Length 且足够大 → 走「流式边收边传」：1GB 文件不再占 1GB 内存。
+        # chunked / 无 CL 的兜底路径仍需整包读取（这类客户端上传大文件极少见）。
+        _streaming = cl_hdr is not None and total > _STREAM_UPLOAD_MIN_BYTES
+        if _streaming:
+            _log(f"PUT 读取请求体: 模式=流式边收边传 size={total}B "
+                 f"(>={_STREAM_UPLOAD_MIN_BYTES // 1024 // 1024}MB 走流式,避免整包占内存)")
+            body_data = None
+        elif cl_hdr is not None:
             body_data = b""
             if total > 0:
-                _log(f"PUT 读取请求体: 模式=Content-Length size={total}B")
+                _log(f"PUT 读取请求体: 模式=Content-Length(整包) size={total}B")
                 body_data = self._read_exact(total)
                 if len(body_data) != total:
                     _log(f"PUT 请求体长度不足(客户端提前断开): 期望 {total}B 实际收到 {len(body_data)}B "
@@ -1203,13 +1350,26 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         n_chunks = (total + chunk_size - 1) // chunk_size if total > 0 else 0
         try:
             if total > 0:
-                self._upload_parallel(body_data, orig_name, multi, chunk_size,
-                                       chunks_meta, file_hash, _MEDIA_HEAD_SAMPLE,
-                                       _MEDIA_TAIL_SAMPLE)
-                head_sample = chunks_meta[0]["_buf"][:_MEDIA_HEAD_SAMPLE] if chunks_meta else b""
-                tail_sample = chunks_meta[-1]["_buf"][-_MEDIA_TAIL_SAMPLE:] if chunks_meta else b""
-                for c in chunks_meta:
-                    c.pop("_buf", None)  # 元信息落库前清掉内存引用
+                if _streaming:
+                    # 边收边传：内存占用恒定，与文件大小无关（1GB+ 文件的关键）
+                    head_sample, tail_sample = self._upload_streaming(
+                        self._iter_body_exact(total), total, orig_name, multi,
+                        chunk_size, chunks_meta, file_hash,
+                        _MEDIA_HEAD_SAMPLE, _MEDIA_TAIL_SAMPLE)
+                    # 流式路径下若客户端提前断开，实际收到的字节会少于 Content-Length
+                    got = sum(c["size"] for c in chunks_meta)
+                    if got != total:
+                        _log(f"PUT 请求体长度不足(客户端提前断开): 期望 {total}B 实际收到 {got}B "
+                             f"path={path}")
+                        raise _tg.TGError("请求体长度不足（客户端提前断开）")
+                else:
+                    self._upload_parallel(body_data, orig_name, multi, chunk_size,
+                                           chunks_meta, file_hash, _MEDIA_HEAD_SAMPLE,
+                                           _MEDIA_TAIL_SAMPLE)
+                    head_sample = chunks_meta[0]["_buf"][:_MEDIA_HEAD_SAMPLE] if chunks_meta else b""
+                    tail_sample = chunks_meta[-1]["_buf"][-_MEDIA_TAIL_SAMPLE:] if chunks_meta else b""
+                    for c in chunks_meta:
+                        c.pop("_buf", None)  # 元信息落库前清掉内存引用
             # 清理残留字节（AList 类 CL 少算），必要时关闭连接
             self._drain_residual()
             _log(f"PUT 分片上传完成(并发={self.app.config._upload_workers(len(self.app.backend.slots))}): "

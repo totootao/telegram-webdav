@@ -39,6 +39,11 @@ class TGError(Exception):
 # 业务型 4xx（换代理无意义，直接抛出交给上层）：429 单独处理（限流，换 bot 重试）
 _BUSINESS_4XX = ("400", "401", "403", "404", "409", "413")
 
+# 单分片下载的瞬断重试次数：代理偶发 ResponseNotReady/连接重置时自动重试同一下载，
+# 避免「大文件里某一个分片短暂抖动就整个下载前功尽弃」。仅在尚未向客户端写出任何字节时
+# 才重试（已写出则不可重试，否则会重复字节污染数据，直接换候选/终止）。
+_CHUNK_RETRY = 3
+
 
 def _http_code_of(msg):
     """从错误消息里提取 HTTP 状态码（如 'HTTP 429' / 'getFile: 403'）。"""
@@ -597,65 +602,95 @@ class TelegramBackend:
         last = None
         t0 = time.time()  # 本分片下载总计时起点（发起 getFile 之前）
         for ci, (api_base, proxy_token) in enumerate(cands):
-            try:
-                fp = self._get_file_path(file_id, token, api_base, proxy_token)
-                base = (api_base or self.api_base).rstrip("/")
-                bp = urllib.parse.urlparse(base).path or ""
-                path = f"{bp}/file/bot{token}/{fp}"
-                rng = None
-                if start is not None:
-                    rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
-                _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} path={path} "
-                     f"proxy_auth={'on' if proxy_token else 'off'}")
-                conn, resp = self._do_get(base, path, proxy_token, rng, timeout=180)
-                alive = not getattr(resp, "will_close", False)
-                if resp.status >= 400:
-                    body = resp.read()
-                    self._release_conn(base, conn, False)
-                    msg = f"iter_chunk HTTP {resp.status}: {body[:160]!r}"
-                    code = str(resp.status)
-                    _log(f"iter_chunk 代理候选 {ci} HTTP {code}: {msg}")
-                    if code == "429":
-                        raise TGError(msg)
-                    if code in _BUSINESS_4XX:
-                        raise TGError(msg)
-                    last = TGError(msg)
-                    _log(f"iter_chunk 代理候选 {ci} 失败({msg})，切换下一代理: api={api_base}")
-                    continue
-                total_yield = 0
-                t_first = None  # 首字节到达时刻（TTFB 依据）
+            attempt = 0
+            while attempt <= _CHUNK_RETRY:
                 try:
-                    while True:
-                        b = resp.read(blk)
-                        if not b:
-                            break
-                        if t_first is None:
-                            t_first = time.time()
-                        total_yield += len(b)
-                        yield b
-                finally:
-                    # 读完整响应体后才归还连接，保证 keep-alive 连接可安全复用
-                    self._release_conn(base, conn, alive)
-                dt_total = time.time() - t0
-                dt_first = (t_first - t0) if t_first is not None else dt_total
-                _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield} "
-                     f"总耗时={dt_total:.3f}s 首字节={dt_first:.3f}s "
-                     f"吞吐={_fmt_speed(total_yield, dt_total)} "
-                     f"proxy={api_base}")
-                return
-            except TGError:
-                raise
-            except (http.client.HTTPException, OSError, socket.timeout) as e:
-                last = e
-                _log(f"iter_chunk 代理候选 {ci} 网络/其他错误: {type(e).__name__}: {e} "
-                     f"api={api_base}")
-                continue
-            except Exception as e:
-                last = e
-                _log(f"iter_chunk 代理候选 {ci} 网络/其他错误: {type(e).__name__}: {e} "
-                     f"api={api_base}")
-                continue
-        raise last or TGError("下载所有代理候选均失败")
+                    fp = self._get_file_path(file_id, token, api_base, proxy_token)
+                    base = (api_base or self.api_base).rstrip("/")
+                    bp = urllib.parse.urlparse(base).path or ""
+                    path = f"{bp}/file/bot{token}/{fp}"
+                    rng = None
+                    if start is not None:
+                        rng = f"bytes={start}-{end}" if end is not None else f"bytes={start}-"
+                    _log(f"iter_chunk 下载: file_id={file_id} slot={slot} range={rng} path={path} "
+                         f"proxy_auth={'on' if proxy_token else 'off'}")
+                    conn, resp = self._do_get(base, path, proxy_token, rng, timeout=180)
+                    alive = not getattr(resp, "will_close", False)
+                    if resp.status >= 400:
+                        body = resp.read()
+                        self._release_conn(base, conn, False)
+                        msg = f"iter_chunk HTTP {resp.status}: {body[:160]!r}"
+                        code = str(resp.status)
+                        _log(f"iter_chunk 代理候选 {ci} HTTP {code}: {msg}")
+                        if code == "429":
+                            raise TGError(msg)
+                        if code in _BUSINESS_4XX:
+                            raise TGError(msg)
+                        last = TGError(msg)
+                        _log(f"iter_chunk 代理候选 {ci} 失败({msg})，切换下一代理: api={api_base}")
+                        break
+                    total_yield = 0
+                    t_first = None  # 首字节到达时刻（TTFB 依据）
+                    try:
+                        while True:
+                            b = resp.read(blk)
+                            if not b:
+                                break
+                            if t_first is None:
+                                t_first = time.time()
+                            total_yield += len(b)
+                            yield b
+                    finally:
+                        # 读完整响应体后才归还连接，保证 keep-alive 连接可安全复用
+                        self._release_conn(base, conn, alive)
+                    dt_total = time.time() - t0
+                    dt_first = (t_first - t0) if t_first is not None else dt_total
+                    _log(f"iter_chunk 下载完成: file_id={file_id} bytes={total_yield} "
+                         f"总耗时={dt_total:.3f}s 首字节={dt_first:.3f}s "
+                         f"吞吐={_fmt_speed(total_yield, dt_total)} "
+                         f"proxy={api_base}")
+                    return
+                except TGError:
+                    raise
+                except (http.client.HTTPException, OSError, socket.timeout) as e:
+                    last = e
+                    # 已向客户端写出任何字节则不可重试（会重复字节污染数据），直接换下一候选
+                    if total_yield > 0:
+                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,不重试): "
+                             f"{type(e).__name__}: {e} api={api_base}")
+                        break
+                    if attempt < _CHUNK_RETRY:
+                        attempt += 1
+                        _log(f"iter_chunk 代理候选 {ci} 瞬断重试({attempt}/{_CHUNK_RETRY}): "
+                             f"{type(e).__name__}: {e} api={api_base}")
+                        time.sleep(min(0.2 * attempt, 1.0))
+                        continue
+                    _log(f"iter_chunk 代理候选 {ci} 网络/其他错误: {type(e).__name__}: {e} "
+                         f"api={api_base}")
+                    break
+                except Exception as e:
+                    last = e
+                    if total_yield > 0:
+                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,不重试): "
+                             f"{type(e).__name__}: {e} api={api_base}")
+                        break
+                    if attempt < _CHUNK_RETRY:
+                        attempt += 1
+                        _log(f"iter_chunk 代理候选 {ci} 瞬断重试({attempt}/{_CHUNK_RETRY}): "
+                             f"{type(e).__name__}: {e} api={api_base}")
+                        time.sleep(min(0.2 * attempt, 1.0))
+                        continue
+                    _log(f"iter_chunk 代理候选 {ci} 网络/其他错误: {type(e).__name__}: {e} "
+                         f"api={api_base}")
+                    break
+            # 该代理候选重试耗尽，继续尝试下一个候选（若有）
+            continue
+        # 所有候选与重试均失败：统一抛 TGError（绝不直接抛裸的 http.client 异常，
+        # 否则 webdav 流式下发的 except _tg.TGError 捕获不到，会变成「未捕获异常(返回500)」
+        # 并在已发 206 头后污染响应体）。
+        if isinstance(last, Exception):
+            raise TGError(f"下载所有代理候选均失败: {type(last).__name__}: {last}")
+        raise TGError("下载所有代理候选均失败")
 
     # ---------- webhook 入站消息解析（参考 getTelegramFileFromMessage） ----------
     @staticmethod

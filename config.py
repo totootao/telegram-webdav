@@ -209,6 +209,10 @@ class Config:
             not in ("0", "off", "false", "no")
         )
         self.warmup_max_files = max(1, int(os.environ.get("TG_WARMUP_MAX_FILES", "20") or 20))
+        # 下载时「滑动窗口」预取后续分片 file_path 的窗口大小（同时最多几个 getFile 在飞）。
+        # 调大：后续分片等待更少；调小：对首片首字节(TTFB)干扰更小、对代理压力更小。
+        # 注意别设太大——曾因一次性预取全部 59 片把代理打满，TTFB 反而从 1.4s 恶化到 14s。
+        self.prefetch_window = max(1, int(os.environ.get("TG_PREFETCH_WINDOW", "3") or 3))
         # 并发度：
         #   TG_UPLOAD_CONCURRENCY   上传分片并发线程数（0=自动，等于 bot 数量，受每 bot 1 msg/s 限流约束不超限）
         #   TG_DOWNLOAD_CONCURRENCY （保留兼容旧配置，但**单文件下载已固定改为单线程串行**——
