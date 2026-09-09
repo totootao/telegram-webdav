@@ -22,6 +22,7 @@ import concurrent.futures
 import datetime
 import http.client
 import json
+import os
 import re
 import socket
 import threading
@@ -52,11 +53,54 @@ _CHUNK_RETRY = 3
 # （nginx 默认 60s、Cloudflare ~100s），用 30s 作为安全阈值：超过 30s 没用的连接
 # 一律视为可疑，取出时直接关掉、走新建连接。30s < 常见代理 idle timeout，
 # 既不浪费复用收益，也不捡到「服务端已 FIN」的僵尸连接。
-_CONN_IDLE_MAX = 30.0
+# P1 修复：连接池条目淘汰上限。代理想 keep-alive 但服务端/中间盒会定时清连接
+# （nginx 默认 60s、Cloudflare ~100s）。
+# seek 优化：idle 上限从 30s 提到默认 120s 并可通过 TG_CONN_IDLE_SEC 调整——播放器
+# 暂停/拖动进度条往往间隔几十秒到几分钟，30s 一过就重新 TLS 握手（实测 0.33~0.38s）
+# 白付一次。放长后由两道保险兜底：① 取出前 MSG_PEEK 探活；② 请求失败即清空该 host 的
+# 池（见 _do_get），不会连续拿到僵尸连接。
+_CONN_IDLE_MAX = float(os.environ.get("TG_CONN_IDLE_SEC", "120") or 120)
 
 # P1 修复：单 host 在池里最多保留多少条 keep-alive 连接。超过就 LRU 关掉最旧那条。
 # 6 条对视频高频 Range 来说已远超实际并发需求（单线程串行下载），更多只会养僵尸。
 _CONN_POOL_MAX = 6
+
+# ---------- seek/起播优化：把「一大段 Range」切成多段，让连接能回池复用 ----------
+# 背景（实测，20MB 分片 / 自建 CF Worker 代理）：
+#   冷连接（每次新建 TCP+TLS）: 首字节 0.49~0.76s（其中 TLS 握手就占 0.33~0.38s）
+#   热连接（复用 keep-alive）  : 首字节 0.16~0.39s
+#   而且大 Range 的整体吞吐明显偏低（片内 10MB Range 只有 3.9MB/s），
+#   切成 2MB+8MB 两段复用连接后同样的数据能跑到 8.96MB/s。
+# 原因：客户端（播放器）起播后往往读几 MB 就断开/重 seek，未读完 body 的连接只能丢弃，
+#   于是每次 seek 都要重新握手。切成小段后每段都能「读完 → 回池」，后续段与下次 seek
+#   都能复用热连接，首字节和吞吐同时改善。
+#
+# 默认**关闭**（实测在自建 CF Worker 代理下有害，见下）。
+#
+# 实测（20MB 分片，otterhub 代理，两轮一致）：
+#   冷连接 + 整片 20MB : 首字节 0.70/0.78s  总 2.23/2.46s  9.4/8.5 MB/s
+#   热连接 + 整片 20MB : 首字节 0.50/0.49s  总 2.16/2.40s  9.7/8.7 MB/s
+#   冷连接 + 片内 10MB : 首字节 0.72/0.74s  总 2.06/2.14s  5.1/4.9 MB/s
+#   热连接 + 片内 10MB : 首字节 0.36/0.35s  总 1.84/1.68s  5.7/6.2 MB/s
+# 结论：热连接确实省 0.2~0.4s，但**每多切一段就要多付一次首字节成本**（小段尤其亏：
+# 2MB 段的 0.35s 首字节比它 0.2s 的传输还久）。端到端实测分段后 60MB 全量从
+# 20MB/s 掉到 7.7MB/s——固定 RTT 摊不薄，反而被放大。
+#
+# 所以默认不切分（一次性大 Range 最划算）；保留开关是为了换环境（比如代理 RTT 极低、
+# 但长连接会被限速）时能一键验证。
+#   TG_SPAN_MB=0        → 关闭分段（默认）
+#   TG_FAST_START_KB=0  → 首段也用 TG_SPAN_MB 的大小（不单独加速起播）
+_SPAN_BYTES = max(0, int(os.environ.get("TG_SPAN_MB", "0") or 0)) * 1024 * 1024
+_FAST_START_BYTES = max(0, int(os.environ.get("TG_FAST_START_KB", "2048") or 2048)) * 1024
+
+# 连接预热（保活）：seek 后客户端常只读一小段就断开，body 没读完 → 这条连接只能丢弃，
+# 于是每次 seek 都要重新做 TLS 握手（实测 0.33~0.38s，占 seek TTFB 的三到五成）。
+# 预热线程让池里**常驻一条只做过握手的热连接**，下次请求直接拿来发请求，省掉握手。
+#   TG_CONN_WARM=0      → 关闭预热
+#   TG_CONN_WARM_IDLE   → 预热连接空闲多少秒后重建（默认 25s，小于常见代理 idle 超时）
+_CONN_WARM = os.environ.get("TG_CONN_WARM", "1") not in ("0", "off", "false", "")
+_CONN_WARM_IDLE = float(os.environ.get("TG_CONN_WARM_IDLE", "25") or 25)
+_CONN_WARM_INTERVAL = float(os.environ.get("TG_CONN_WARM_INTERVAL", "2") or 2)
 
 # P3 修复：_do_get 默认总超时（含建连+响应头+响应体）。原本硬编码 180s 等于黑洞场景
 # 必挂死，现在按调用方语义取：getFile 走 30s（接口小响应），分片下载走 30s（默认），
@@ -191,6 +235,76 @@ class TelegramBackend:
             cands = self._candidates[i]
             _log(f"  槽位 {i}: chat_id={s['chat_id']} 代理候选数={len(cands)} "
                  f"首候选={cands[0][0] if cands else self.api_base}")
+        # 预热（保活）目标 host：所有槽位候选去重后的 (scheme,host,port) 对应的 api_base
+        self._warm_hosts = []
+        seen = set()
+        for cands in self._candidates.values():
+            for (b, _t) in cands:
+                if b not in seen:
+                    seen.add(b)
+                    self._warm_hosts.append(b)
+        self._last_activity = time.time()
+        self._warm_stop = False
+        if _CONN_WARM and self._warm_hosts:
+            threading.Thread(target=self._warm_loop, daemon=True).start()
+            _log(f"连接预热已开启: host数={len(self._warm_hosts)} "
+                 f"保活间隔={_CONN_WARM_INTERVAL}s 连接空闲上限={_CONN_WARM_IDLE}s")
+
+    # ---------- 连接预热（保活） ----------
+    def _warm_loop(self):
+        """后台巡检：保证每个代理 host 的池里常有一条「只做过 TLS 握手」的热连接。
+
+        为什么有用：seek 之后客户端往往只读几 MB 就断开，未读完 body 的连接只能丢弃。
+        没有预热的话，下一次 seek 必须重新握手（实测 0.33~0.38s）。提前把握手做掉，
+        请求一来就能直接发，省掉的正是这部分固定延迟。
+
+        空闲超过 _CONN_WARM_IDLE 的连接会被重建（代理/CF 会静默关闭长空闲连接）；
+        5 分钟没有任何请求时暂停预热，避免空转骚扰代理。
+        """
+        while not self._warm_stop:
+            try:
+                time.sleep(_CONN_WARM_INTERVAL)
+                if time.time() - self._last_activity > 300:
+                    continue
+                for host in list(self._warm_hosts):
+                    try:
+                        self._warm_one(host)
+                    except Exception:
+                        pass
+            except Exception:
+                time.sleep(_CONN_WARM_INTERVAL)
+
+    def _warm_one(self, api_base):
+        """保证 api_base 池里有一条（不超过保活上限年龄的）已握手连接。"""
+        key = self._conn_key(api_base)
+        now = time.time()
+        need = True
+        with self._conn_lock:
+            dq = self._conn_pool.get(key)
+            if dq:
+                # 池里最旧一条若还在保活年龄内，就不必重建
+                oldest = min((ts for (_c, ts) in dq), default=0)
+                need = (now - oldest) > _CONN_WARM_IDLE
+                if need:
+                    for conn, _ in dq:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    dq.clear()
+        if not need:
+            return
+        conn = self._open_conn(api_base, timeout=_DEFAULT_HTTP_TIMEOUT)
+        try:
+            conn.connect()  # 只做 TCP + TLS 握手，不发任何请求
+        except Exception as e:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _log(f"连接预热失败(忽略): host={key[1]} {type(e).__name__}: {e}")
+            return
+        self._release_conn(api_base, conn, True)
 
     # ---------- 代理候选列表（多个 TG 代理） ----------
     def _build_candidates(self, slot):
@@ -401,6 +515,11 @@ class TelegramBackend:
         （仍给池一次机会，区别只在 timeout 不再是 180s）。
         """
         last = None
+        # 预热线程用：有请求活动就刷新时间戳（长时间无请求时暂停预热）
+        try:
+            self._last_activity = time.time()
+        except Exception:
+            pass
         # 第 1 次：force_new 时直接 _open_conn，否则池优先
         # 第 2 次：池/新建依 force_new 切换，失败即退出
         tried = 0
@@ -430,10 +549,30 @@ class TelegramBackend:
                     conn.close()
                 except Exception:
                     pass
+                # seek 优化：一次请求失败，说明这个 host 的 keep-alive 连接大概率已被
+                # 中间盒静默关掉（本地看连接还在，服务端早 FIN 了）。此时**清空该 host 的
+                # 整池**，否则下一次取出的还是同一批僵尸连接，白白再付一次超时。
+                self._drop_pool(api_base, reason=f"{type(e).__name__}: {e}")
                 if tried >= 2:
                     break
                 # 第 1 次失败，再试一次（无论是 force_new 还是 not，都会换连接尝试）
         raise last or TGError("连接失败")
+
+    def _drop_pool(self, api_base, reason=""):
+        """关闭并清空某个 host 的全部池中连接（请求失败后调用，防僵尸连接连续污染）。"""
+        key = self._conn_key(api_base)
+        with self._conn_lock:
+            dq = self._conn_pool.pop(key, None)
+        n = 0
+        if dq:
+            for conn, _ in dq:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                n += 1
+        if n:
+            _log(f"连接池已清空: host={key[1]} 关闭={n}条 原因={reason}")
 
     # ---------- 限流 ----------
     def _rate_wait(self, idx):
@@ -747,8 +886,57 @@ class TelegramBackend:
             list(ex.map(_one, items))
         _log(f"file_path 预取完成: 分片数={len(items)} 耗时={time.time() - t0:.3f}s")
 
+    def _plan_spans(self, start, end):
+        """把一段 Range 切成若干「小段」，返回 [(s, e), ...]（含端点）。
+
+        目的不是省流量，而是让**连接能被复用**：播放器起播后常常读几 MB 就断开/重新
+        seek，未读完 body 的连接只能丢弃。切成小段后每段都能「读完 → 回池」，
+        后续段和下一次 seek 都能走热连接（实测首字节 0.7~0.9s → 0.16~0.39s）。
+
+        切分规则（总长 <= 单段大小时不切，行为与旧版完全一致）：
+          第 1 段 = TG_FAST_START_KB（默认 2MB，尽快出首字节）
+          第 2 段起 = TG_SPAN_MB（默认 8MB）
+        TG_SPAN_MB=0 表示关闭分段（回退到「一次请求拿完整段」的旧行为）。
+        """
+        if _SPAN_BYTES <= 0 or start is None or end is None:
+            return [(start, end)]
+        total = end - start + 1
+        if total <= _SPAN_BYTES:
+            return [(start, end)]
+        first = min(_FAST_START_BYTES if _FAST_START_BYTES > 0 else _SPAN_BYTES, total)
+        spans = []
+        cur = start
+        while cur <= end:
+            size = first if cur == start else _SPAN_BYTES
+            e = min(cur + size - 1, end)
+            spans.append((cur, e))
+            cur = e + 1
+        return spans
+
     def iter_chunk(self, file_id, slot, start=None, end=None, blk=None, ctx=None):
         """生成器：按 Range 取回单块字节。start/end 为相对该块的字节区间（含端点）。
+
+        对外签名与语义**完全不变**：调用方（webdav 流式下发）仍旧「yield 到多少就
+        写多少」。内部在总长超过 TG_SPAN_MB 时会拆成多段顺序下载，每段读完即归还
+        keep-alive 连接，从而让后续段与后续请求复用热连接（详见 _plan_spans 注释）。
+        """
+        spans = self._plan_spans(start, end)
+        if len(spans) <= 1:
+            yield from self._iter_chunk_range(file_id, slot, start, end, blk, ctx)
+            return
+        _log(f"iter_chunk 分段下载: file_id={file_id} range={start}-{end} "
+             f"段数={len(spans)} 段大小={[e - s + 1 for (s, e) in spans]}")
+        for i, (s, e) in enumerate(spans):
+            # 第 2 段起：前面已经向客户端写出过字节，本段任何失败都不可重试/换候选
+            # （P0：重复下发会污染客户端数据），直接抛 TGError 让上层中断连接。
+            yield from self._iter_chunk_range(file_id, slot, s, e, blk, ctx,
+                                              no_switch=(i > 0))
+
+    def _iter_chunk_range(self, file_id, slot, start=None, end=None, blk=None,
+                          ctx=None, no_switch=False):
+        """下载 [start, end] 这一段（iter_chunk 的单段实现）。
+
+        ``no_switch=True`` 表示外层已写出过字节：本段失败不可重试/换候选，直接抛错。
 
         ``blk`` 是每次 ``resp.read()`` 的块大小，直接决定「读到多少字节就 yield 一次」，
         也就是流式下发时客户端每隔多久收到一批数据：块越小越平滑、首字节越快，
@@ -892,10 +1080,10 @@ class TelegramBackend:
                     # P0 修复：已 yield 过字节 → 不再换候选、不再重试，直接上抛。
                     # 旧逻辑「break 到外层 for 换候选」会让下游在已写 N 字节后又从头
                     # yield 整片，超出 Content-Length → 污染客户端 / 错位 keep-alive。
-                    if total_yield > 0:
-                        _log(f"iter_chunk 代理候选 {ci} 下载中断(已写 {total_yield}B,"
+                    if total_yield > 0 or no_switch:
+                        _log(f"iter_chunk 代理候选 {ci} 下载中断(本段已写 {total_yield}B,"
                              f"不再换候选/重试): {type(e).__name__}: {e} api={api_base}")
-                        raise TGError(f"下载分片中断(已写 {total_yield}B): "
+                        raise TGError(f"下载分片中断(本段已写 {total_yield}B): "
                                       f"{type(e).__name__}: {e}")
                     # 未写出字节：可重试或换候选
                     if attempt < _CHUNK_RETRY:

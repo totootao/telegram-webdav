@@ -353,10 +353,37 @@ def test_f_pool_hygiene():
 
     be = _tg.TelegramBackend(slots=[{"token": "T", "chat_id": "C"}],
                               api_base="http://127.0.0.1:1", rate_limit=0)
-    check("F1 _CONN_IDLE_MAX=30s 已生效", _tg._CONN_IDLE_MAX == 30.0,
-          f"actual={_tg._CONN_IDLE_MAX}")
+    # seek 优化后：idle TTL 默认从 30s 提到 120s 并可由 TG_CONN_IDLE_SEC 覆盖
+    # （播放器暂停/拖动进度条常间隔几十秒，30s 一过就白付一次 TLS 握手 ≈0.35s）。
+    # 这里只校验「阈值存在且落在合理区间」，具体值交由部署环境按需调整。
+    check("F1 连接池 idle 阈值在合理区间(>=30s)",
+          30.0 <= _tg._CONN_IDLE_MAX <= 600.0,
+          f"actual={_tg._CONN_IDLE_MAX}s (TG_CONN_IDLE_SEC 可调)")
     check("F2 _CONN_POOL_MAX=6 已生效", _tg._CONN_POOL_MAX == 6,
           f"actual={_tg._CONN_POOL_MAX}")
+    # 请求失败后必须清空该 host 的池，否则会连续取到僵尸连接
+    check("F2b 存在 _drop_pool（请求失败即清池）",
+          hasattr(be, "_drop_pool"),
+          f"has={hasattr(be, '_drop_pool')}")
+    # 分段下载：默认**关闭**（实测大 Range 更划算，见 tg._SPAN_BYTES 注释）；
+    # 打开后必须切成首尾相接、完整覆盖原区间的多段。
+    MB = 1024 * 1024
+    check("F2c 默认不分段（大 Range 一次性下载）",
+          be._plan_spans(0, 20 * MB - 1) == [(0, 20 * MB - 1)],
+          f"spans={be._plan_spans(0, 20 * MB - 1)}")
+    _old = _tg._SPAN_BYTES
+    try:
+        _tg._SPAN_BYTES = 8 * MB
+        sp = be._plan_spans(0, 20 * MB - 1)
+        check("F2d 开启分段后首尾相接且完整覆盖",
+              len(sp) > 1 and sp[0][0] == 0 and sp[-1][1] == 20 * MB - 1
+              and all(sp[i][1] + 1 == sp[i + 1][0] for i in range(len(sp) - 1)),
+              f"spans={[(s // MB, e // MB) for s, e in sp]}")
+        check("F2e 不超过单段大小的区间仍不切分",
+              be._plan_spans(0, 1023) == [(0, 1023)],
+              f"spans={be._plan_spans(0, 1023)}")
+    finally:
+        _tg._SPAN_BYTES = _old
     check("F3 _DEFAULT_HTTP_TIMEOUT=30 已生效", _tg._DEFAULT_HTTP_TIMEOUT == 30.0,
           f"actual={_tg._DEFAULT_HTTP_TIMEOUT}")
     sig = inspect.signature(be._open_conn)
