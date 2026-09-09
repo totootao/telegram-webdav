@@ -169,6 +169,113 @@ def _up_backoff(attempt, msg):
     return min(30, 2 ** attempt)
 
 
+# ---------------- 请求级观测：超时到底卡在谁身上、重试了几次 ----------------
+# 背景：标准库 http.server 在 rfile 读/写超时时，是在 *它自己* 的 handle_one_request
+# 内部 except TimeoutError 后直接 log_error("Request timed out: %r") 的——外层覆写的
+# handle_one_request 根本感知不到，日志里只剩一行没有主体、没有路径、没有重试信息的
+# 「172.17.0.1 - - [...] Request timed out: TimeoutError('timed out')」。
+# 所以这里做三件事：
+#   1) 覆写 log_error 拦下这条日志，补上「哪个请求、卡在哪个阶段」；
+#   2) 用 _ReqCtx 累计本次请求的分片重试次数，回答「有没有重试、重试了几次」；
+#   3) 区分 keep-alive 空闲等待超时（正常回收，默认静默）与请求处理中超时（真问题）。
+# 空闲超时默认不打日志（DAV_LOG_IDLE_TIMEOUT=on 可打开），否则刷屏淹掉真问题。
+import os as _os
+
+_LOG_IDLE_TIMEOUT = str(_os.getenv("DAV_LOG_IDLE_TIMEOUT", "off")).lower() == "on"
+
+
+class _ReqCtx:
+    """一次 WebDAV 请求的观测上下文：谁、干什么、重试了几次、跑了多久。
+
+    刻意**不用** threading.local：上传/下载分片跑在 ThreadPoolExecutor 里，
+    线程 local 传不进去；只有显式把 ctx 对象往下传（``tg.iter_chunk(ctx=...)``），
+    才能把分片级重试次数累计到「发起它的那条 WebDAV 请求」上。
+    """
+
+    __slots__ = ("peer", "method", "path", "seq", "t0", "lock",
+                 "up_retry", "down_retry", "up_chunks", "up_reused")
+
+    def __init__(self, peer, method, path, seq):
+        self.peer = peer
+        self.method = method
+        self.path = path
+        self.seq = seq
+        self.t0 = time.time()
+        self.lock = threading.Lock()
+        self.up_retry = 0      # 上传分片重试次数（含 429 退避重试）
+        self.down_retry = 0    # 下载分片瞬断重试次数
+        self.up_chunks = 0     # 本次真正上传到 Telegram 的分片数
+        self.up_reused = 0     # 命中 SHA 去重、直接复用的分片数
+
+    def bump_up(self, n=1):
+        with self.lock:
+            self.up_retry += n
+
+    def bump_down(self, n=1):
+        with self.lock:
+            self.down_retry += n
+
+    @property
+    def elapsed(self):
+        return time.time() - self.t0
+
+    def key(self):
+        return (self.peer, self.method, self.path)
+
+    def retry_desc(self):
+        """重试情况的一句话摘要。"""
+        parts = []
+        if self.up_retry:
+            parts.append(f"上传分片重试{self.up_retry}次")
+        if self.down_retry:
+            parts.append(f"下载分片重试{self.down_retry}次")
+        return "、".join(parts) if parts else "无重试(一次通过)"
+
+    def op(self):
+        return f"{self.method} {self.path}"
+
+
+class _TimeoutStats:
+    """按「客户端 + method + path」聚合的超时历史，用来回答「后来有重试没」。
+
+    - 超时发生 → timeout 计数 +1；
+    - 同一 key 的下一次请求进来 → attempt 计数 +1（说明客户端/上游确实重发了）。
+    两者结合就能在日志里直接看出来：这个访问超时过几次、之后又被重试了几次。
+    """
+
+    _WINDOW = 30 * 60.0   # 30 分钟内的重复访问视为同一件事的「重试」
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._m = {}
+
+    def on_timeout(self, ctx):
+        """记录一次超时，返回 (该请求累计超时次数, 客户端累计尝试次数)。"""
+        with self._lock:
+            self._prune()
+            e = self._m.setdefault(ctx.key(), {"timeout": 0, "attempt": 0, "last": 0.0})
+            e["timeout"] += 1
+            e["last"] = time.time()
+            return e["timeout"], e["attempt"]
+
+    def on_attempt(self, ctx):
+        """新请求开始，返回 (此前累计超时次数, 本次是第几次尝试)。"""
+        with self._lock:
+            self._prune()
+            e = self._m.setdefault(ctx.key(), {"timeout": 0, "attempt": 0, "last": 0.0})
+            e["attempt"] += 1
+            e["last"] = time.time()
+            return e["timeout"], e["attempt"]
+
+    def _prune(self):
+        now = time.time()
+        for k in [k for k, v in self._m.items() if now - v["last"] > self._WINDOW]:
+            del self._m[k]
+
+
+_TIMEOUT_STATS = _TimeoutStats()
+
+
 class _IntegrityError(Exception):
     """下载分片时检测到内容完整性被破坏（哈希不符或被截断）。
 
@@ -253,6 +360,107 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
         super().log_message(fmt, *args)
 
+    def log_error(self, fmt, *args):
+        """拦截标准库的超时日志，补上「哪个请求 + 重试了几次」。
+
+        http.server 在 rfile 读/写超时时，是在基类 handle_one_request **内部** 就
+        except 掉 TimeoutError 并 log_error 的，外层覆写的 handle_one_request 的
+        except 完全感知不到（异常根本没抛出来）。所以只能在这一层拦。
+        """
+        try:
+            msg = fmt % args if args else fmt
+        except Exception:
+            msg = fmt
+        if "Request timed out" in str(msg):
+            self._on_request_timeout(str(msg))
+            return
+        super().log_error(fmt, *args)
+
+    def parse_request(self):
+        """请求行 + 头解析成功 → 建立本次请求的观测上下文。
+
+        只有走到这里才说明「确实有一个真请求在处理」。读请求行就超时的情况
+        （keep-alive 空闲等待下一条请求）不会到这里，据此把「空闲回收」与
+        「请求处理中超时」区分开——前者是正常行为，后者才是要排查的问题。
+        """
+        ok = super().parse_request()
+        if ok:
+            self._req_parsed = True
+            self._conn_seq += 1
+            peer = self.client_address[0] if self.client_address else "-"
+            self._ctx = _ReqCtx(peer, self.command, self.path, self._conn_seq)
+            n_timeout, n_attempt = _TIMEOUT_STATS.on_attempt(self._ctx)
+            if n_timeout and n_attempt > 1:
+                _log(f"请求重传: 客户端={peer} 连接内第{self._conn_seq}个请求 "
+                     f"{self.command} {self.path} —— 该访问此前已超时 {n_timeout} 次，"
+                     f"这是第 {n_attempt} 次尝试"
+                     + ("（已成功的分片会按 SHA 去重复用，只补传失败片）"
+                        if self.command == "PUT" else ""))
+        return ok
+
+    def _on_request_timeout(self, raw):
+        """超时详情。分两种：空闲连接回收（正常）与请求处理中超时（要查）。"""
+        peer = self.client_address[0] if self.client_address else "-"
+        port = (self.client_address[1]
+                if self.client_address and len(self.client_address) > 1 else "-")
+
+        # 请求行都还没解析出来 → 卡在「等下一条请求」，是 keep-alive 的正常回收
+        if not self._req_parsed:
+            if _LOG_IDLE_TIMEOUT:
+                _log(f"连接空闲超时(正常回收,无需处理): 客户端={peer}:{port} "
+                     f"等待下一条请求超 {self._idle_timeout_used:.0f}s 未收到数据，关闭连接 "
+                     f"—— 上一个请求: {self._last_req}")
+            return
+
+        ctx = self._ctx
+        if ctx is None:
+            # 请求行已读到一半（raw_requestline 非空）但没解析出 method/path
+            _log(f"请求超时: 客户端={peer}:{port} 卡在请求行/请求头解析阶段，"
+                 f"未取得 method/path。细节={raw}")
+            return
+
+        if not self._response_started:
+            if self._body_read:
+                stage = "读取请求体"
+            elif self.headers.get("Content-Length") or self.headers.get("Transfer-Encoding"):
+                stage = "读取请求体(尚未收到任何 body)"
+            else:
+                stage = "读取请求头"
+        else:
+            stage = "写出响应给客户端"
+        body_desc = ""
+        if self._body_read:
+            body_desc = f" 已读请求体={_fmt_size(self._body_read)}"
+            try:
+                clen = int(self.headers.get("Content-Length") or 0)
+            except Exception:
+                clen = 0
+            if clen:
+                body_desc += f"/共{_fmt_size(clen)}({self._body_read * 100.0 / clen:.0f}%)"
+
+        n_timeout, n_attempt = _TIMEOUT_STATS.on_timeout(ctx)
+        _log(f"请求超时(连接已关闭,需重新发起): 客户端={ctx.peer}:{port} "
+             f"请求={ctx.op()} 卡在={stage}{body_desc} 已耗时={ctx.elapsed:.1f}s "
+             f"重试情况={ctx.retry_desc()} "
+             f"| 该访问累计超时{n_timeout}次/客户端累计尝试{n_attempt}次"
+             + (f" | 重发 PUT 时已成功的分片会按 SHA 去重复用，只补传失败片"
+                if ctx.method == "PUT" else "")
+             + f" | 底层={raw}")
+        self._last_req = f"{ctx.op()}(超时)"
+
+    def _finish_ctx(self):
+        """请求正常收尾：给空闲超时日志留一句「上一个请求」的描述。"""
+        ctx = self._ctx
+        if ctx is None:
+            return None
+        if not self._hdr_status:
+            # 未产生响应（超时/中断）：描述已由超时日志写好，不覆盖
+            return None
+        if ctx.up_retry or ctx.down_retry:
+            _log(f"请求完成(过程中有重试): 客户端={ctx.peer} {ctx.op()} "
+                 f"重试={ctx.retry_desc()} 总耗时={ctx.elapsed:.1f}s")
+        return f"{ctx.op()} status={self._hdr_status}"
+
     # ---------------- 请求级状态 ----------------
     def __init__(self, *args, **kwargs):
         self._body_read = 0
@@ -261,6 +469,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         self._response_started = False
         self._request_body = None
         self._read_timeout = _BODY_TIMEOUT
+        # 超时观测相关
+        self._ctx = None
+        self._req_parsed = False
+        self._conn_seq = 0
+        self._last_req = "-"
+        self._idle_timeout_used = 0.0
         super().__init__(*args, **kwargs)
 
     def handle_one_request(self):
@@ -278,12 +492,23 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         self._hdr_conn_sent = False
         self._response_started = False
         self._request_body = None
+        self._req_parsed = False
+        self._ctx = None
         try:
             self.connection.settimeout(self.app.config.idle_timeout)
+            self._idle_timeout_used = float(self.app.config.idle_timeout)
+            # 请求体读超时取自 config（DAV_BODY_TIMEOUT，默认 300s）；模块常量只作兜底。
+            # 之前这里一直用死常量，导致 DAV_BODY_TIMEOUT 配了也不生效——
+            # 客户端慢到想放宽/收紧请求体超时时无从下手，只能干等 300s 才断。
+            self._read_timeout = float(
+                getattr(self.app.config, "body_timeout", 0) or _BODY_TIMEOUT)
         except Exception:
             pass
         try:
             super().handle_one_request()
+            _d = self._finish_ctx()
+            if _d:
+                self._last_req = _d
         except (ConnectionError, TimeoutError, socket.timeout):
             # 客户端断开 / 空闲超时回收：正常行为，静默关闭，不刷日志
             self.close_connection = True
@@ -802,6 +1027,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 self.app.db.put_chunk_dedup(chunk_sha, fid, slot, mid, len(buf))
             return ci, fid, slot, mid, chunk_sha, buf, False
 
+        ctx = getattr(self, "_ctx", None)   # 请求级重试计数（超时日志要打印）
+
         def _one_retry(ci, buf):
             """上传单分片，失败只重试这一片（不牵连其他分片），重试耗尽才抛出。"""
             last = None
@@ -813,6 +1040,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     if attempt >= _UP_CHUNK_RETRY:
                         break
                     _log(f"PUT 分片[{ci}] 上传失败，重试({attempt + 1}/{_UP_CHUNK_RETRY}): {e}")
+                    if ctx is not None:
+                        ctx.bump_up()
                     time.sleep(_up_backoff(attempt, str(e)))
             raise last
 
@@ -900,6 +1129,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                 self.app.db.put_chunk_dedup(chunk_sha, fid, slot, mid, len(buf))
             return ci, fid, slot, mid, chunk_sha, buf, False
 
+        ctx = getattr(self, "_ctx", None)   # 请求级重试计数（超时日志要打印）
+
         def _one_retry(ci, buf):
             """上传单分片，失败只重试这一片（不牵连其他分片），重试耗尽才抛出。"""
             last = None
@@ -911,6 +1142,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                     if attempt >= _UP_CHUNK_RETRY:
                         break
                     _log(f"PUT 分片[{ci}] 上传失败，重试({attempt + 1}/{_UP_CHUNK_RETRY}): {e}")
+                    if ctx is not None:
+                        ctx.bump_up()
                     time.sleep(_up_backoff(attempt, str(e)))
             raise last
 
@@ -988,7 +1221,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         t_first = None
         try:
             for block in self.app.backend.iter_chunk(
-                c["file_id"], c.get("slot", 0), rs, re_, blk=blk
+                c["file_id"], c.get("slot", 0), rs, re_, blk=blk,
+                ctx=getattr(self, "_ctx", None),
             ):
                 if t_first is None:
                     t_first = time.time()
@@ -1192,7 +1426,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         def _collect(ci, c, rs, re_):
             data = b"".join(self.app.backend.iter_chunk(
-                c["file_id"], c.get("slot", 0), rs, re_
+                c["file_id"], c.get("slot", 0), rs, re_,
+                ctx=getattr(self, "_ctx", None),
             ))
             return ci, data
 

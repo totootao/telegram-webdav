@@ -583,12 +583,16 @@ class TelegramBackend:
             list(ex.map(_one, items))
         _log(f"file_path 预取完成: 分片数={len(items)} 耗时={time.time() - t0:.3f}s")
 
-    def iter_chunk(self, file_id, slot, start=None, end=None, blk=None):
+    def iter_chunk(self, file_id, slot, start=None, end=None, blk=None, ctx=None):
         """生成器：按 Range 取回单块字节。start/end 为相对该块的字节区间（含端点）。
 
         ``blk`` 是每次 ``resp.read()`` 的块大小，直接决定「读到多少字节就 yield 一次」，
         也就是流式下发时客户端每隔多久收到一批数据：块越小越平滑、首字节越快，
         块越大系统调用越少。由 webdav 层按 ``TG_STREAM_BLOCK_KB`` 传入（缺省 1MB）。
+
+        ``ctx`` 是 webdav 侧传下来的请求观测对象（可空）：每次瞬断重试都会
+        ``ctx.bump_down()``，这样请求超时/结束时日志能打印「下载分片重试了几次」，
+        否则分片重试散落在各个下载线程里，外部完全看不到。
 
         遍历该 bot 的全部代理候选：某代理网络/5xx 失败自动切换下一个；4xx/429 直接抛出。
         连接走 keep-alive 连接池（_do_get/_release_conn），视频高频 Range 下省去重复握手。
@@ -665,6 +669,11 @@ class TelegramBackend:
                         break
                     if attempt < _CHUNK_RETRY:
                         attempt += 1
+                        if ctx is not None:
+                            try:
+                                ctx.bump_down()
+                            except Exception:
+                                pass
                         _log(f"iter_chunk 代理候选 {ci} 瞬断重试({attempt}/{_CHUNK_RETRY}): "
                              f"{type(e).__name__}: {e} api={api_base}")
                         time.sleep(min(0.2 * attempt, 1.0))
@@ -680,6 +689,11 @@ class TelegramBackend:
                         break
                     if attempt < _CHUNK_RETRY:
                         attempt += 1
+                        if ctx is not None:
+                            try:
+                                ctx.bump_down()
+                            except Exception:
+                                pass
                         _log(f"iter_chunk 代理候选 {ci} 瞬断重试({attempt}/{_CHUNK_RETRY}): "
                              f"{type(e).__name__}: {e} api={api_base}")
                         time.sleep(min(0.2 * attempt, 1.0))

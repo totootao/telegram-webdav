@@ -1,6 +1,6 @@
 # 真实场景测试报告
 
-- 测试时间：2026-09-09 09:02:07
+- 测试时间：2026-09-09 10:39:52
 - 单分片人为延迟：`0.15s`（模拟真实 Telegram / 自建代理单分片下载耗时）
 - 分片大小：`20MB`
 - 下载模式：**单线程串行**（首片边下边发，其余分片主线程依次下载→校验→回写）
@@ -20,7 +20,7 @@
 
 | 用例 | 结果 | 说明 |
 |---|---|---|
-| put.big.multi_chunk | PASS | status=201 chunks=5 put=4.08s |
+| put.big.multi_chunk | PASS | status=201 chunks=5 put=4.09s |
 | get.big.full(200) | PASS | status=200 |
 | get.big.bytes_identical | PASS | len=104857600 expect=104857600 |
 | get.big.sha256_identical | PASS |  |
