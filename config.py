@@ -148,6 +148,13 @@ class Config:
         self.api_base = os.environ.get(
             "TG_API_BASE", "https://api.telegram.org"
         ).rstrip("/")
+        # api_base 是不是用户**显式**配的（而不是上面那个默认值）。
+        # 只有显式配了，tg 层才会把它当兜底代理候选；否则一旦只配 TG_PROXY_POOLS，
+        # 就会凭空多出一个 api.telegram.org 候选——在国内网络是黑洞，
+        # 连接超时 180s，代理全挂时会把「几秒报错」拖成「卡十几分钟」。
+        self.api_base_explicit = bool(
+            (os.environ.get("TG_API_BASE") or "").strip()
+        )
         # 自建 Telegram API 代理（如 tg.<domain>/tg）若额外要求认证，用此令牌
         # 以 Authorization: Bearer <token> 头发送；官方 api.telegram.org 下不需要，留空即可。
         # 同样作为 TG_BOT_POOLS 各槽位未单独指定 proxyToken 时的回退。

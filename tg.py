@@ -122,7 +122,8 @@ def _build_multipart(boundary, fields, files):
 
 class TelegramBackend:
     def __init__(self, slots, api_base="https://api.telegram.org", rate_limit=1.0,
-                 proxy_token=None, rotate=True, proxy_pools=None):
+                 proxy_token=None, rotate=True, proxy_pools=None,
+                 api_base_explicit=True):
         self.slots = slots  # [{"token","chat_id","api_base"(可数组),"proxy_token"(可数组)}]
         self.api_base = api_base.rstrip("/")  # 全局默认 API 基址（槽位级可覆盖）
         self.rate_limit = float(rate_limit)
@@ -132,6 +133,9 @@ class TelegramBackend:
         self.rotate = bool(rotate)
         # 全局代理候选池（所有 bot 共享）：[(api_base, proxy_token), ...]
         self.proxy_pools = [tuple(p) for p in (proxy_pools or [])]
+        # api_base 是否用户显式配的。False 时只把它当「一个地址都没有」时的最后退路，
+        # 不会凭空塞进候选列表（详见 _build_candidates 注释）。
+        self.api_base_explicit = bool(api_base_explicit)
         self._lock = threading.Lock()
         self._last = {}  # slot idx -> 上次发送时间
         self._path_cache = {}  # file_id -> (file_path, expire_ts)
@@ -152,7 +156,8 @@ class TelegramBackend:
         _log(f"TelegramBackend 初始化: slots={len(self.slots)} "
              f"rate_limit={self.rate_limit}s rotate={self.rotate} "
              f"global_api_base={self.api_base} global_proxy_auth={'on' if self.proxy_token else 'off'} "
-             f"global_proxy_pools={len(self.proxy_pools)}")
+             f"global_proxy_pools={len(self.proxy_pools)} "
+             f"api_base_explicit={'on' if self.api_base_explicit else 'off'}")
         for i, s in enumerate(self.slots):
             cands = self._candidates[i]
             _log(f"  槽位 {i}: chat_id={s['chat_id']} 代理候选数={len(cands)} "
@@ -181,12 +186,18 @@ class TelegramBackend:
             cands.append((b.rstrip("/"), tk))
         for (gb, gt) in self.proxy_pools:
             cands.append((gb.rstrip("/"), gt))
-        # 全局默认 api_base 作为兜底候选：必须**始终**追加（去重后）。
+        # 兜底全局 api_base：显式配过就**始终**追加（去重后）。
         # 旧写法是 `if not cands: cands.append(api_base)` —— 一旦配了 TG_PROXY_POOLS，
         # TG_API_BASE 里配的主代理就被整个丢掉：想「多一个备用」结果变成「换掉主用」。
+        #
+        # 但「始终追加」也会引入新问题：完全不配 TG_API_BASE 时它默认是
+        # api.telegram.org，凭空成为最后一个候选——国内网络下是黑洞，
+        # 连接超时 180s，代理全挂时会把「几秒报错」拖成「卡十几分钟」。
+        # 所以没显式配过、且池里已经有候选时，就不追加这个默认值。
         fb = (self.api_base.rstrip("/"), self.proxy_token)
-        if fb not in cands:
-            cands.append(fb)
+        if self.api_base_explicit or not cands:
+            if fb not in cands:
+                cands.append(fb)
         return cands
 
     def _next_slot(self):

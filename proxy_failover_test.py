@@ -34,10 +34,11 @@ def check(name, cond, detail=""):
           + name + (("  -> " + detail) if detail else ""))
 
 
-def _mk(api_base, proxy_token, pools, slots=None):
+def _mk(api_base, proxy_token, pools, slots=None, api_base_explicit=True):
     slots = slots if slots is not None else [{"token": "T", "chat_id": "C"}]
     return TelegramBackend(slots=slots, api_base=api_base, proxy_token=proxy_token,
-                           proxy_pools=pools, rate_limit=0, rotate=True)
+                           proxy_pools=pools, rate_limit=0, rotate=True,
+                           api_base_explicit=api_base_explicit)
 
 
 # ---------------------------------------------------------------- A 组：构建候选（纯单元，不联网）
@@ -72,6 +73,19 @@ def test_a_build():
     check("A5 槽位自带 == 全局默认：结尾不再重复追加",
           c == [(GLOBAL_BASE, tok), (POOL_BASE, ptok)], str(c))
 
+    # 只配 TG_PROXY_POOLS、不配 TG_API_BASE 的用法（docker run 想省掉那两行 -e）
+    b = _mk("https://api.telegram.org", None, [(POOL_BASE, None), (GLOBAL_BASE, tok)],
+            api_base_explicit=False)
+    c = b._build_candidates(b.slots[0])
+    check("A6 未显式配 TG_API_BASE：不把默认的 api.telegram.org 塞进候选"
+          "（否则它是黑洞，全挂时会卡满 180s 超时）",
+          c == [(POOL_BASE, None), (GLOBAL_BASE, tok)], str(c))
+
+    b = _mk("https://api.telegram.org", None, [], api_base_explicit=False)
+    c = b._build_candidates(b.slots[0])
+    check("A7 未显式配且池也为空：仍保留默认兜底，不能出现零候选",
+          c == [("https://api.telegram.org", None)], str(c))
+
 
 # ---------------------------------------------------------------- B 组：真实联网
 def test_b_real():
@@ -92,11 +106,13 @@ def test_b_real():
     n = 256 * 1024
     be = TelegramBackend(slots=cfg.slots, api_base=cfg.api_base,
                          proxy_token=cfg.proxy_token, proxy_pools=cfg.proxy_pools,
-                         rate_limit=0, rotate=cfg.slot_rotate)
+                         rate_limit=0, rotate=cfg.slot_rotate,
+                         api_base_explicit=cfg.api_base_explicit)
     c0 = be._candidates[0]
-    expect = len(cfg.proxy_pools) + 1  # 池里的候选 + 全局默认兜底
-    check("B1 生产配置下每个 bot 都有 %d 个代理候选（池 %d + 全局兜底 1）"
-          % (expect, len(cfg.proxy_pools)),
+    # 显式配了 TG_API_BASE 才会多一个兜底候选，否则池里几个就是几个
+    expect = len(cfg.proxy_pools) + (1 if cfg.api_base_explicit else 0)
+    check("B1 生产配置下每个 bot 都有 %d 个代理候选（池 %d + 兜底 %d）"
+          % (expect, len(cfg.proxy_pools), expect - len(cfg.proxy_pools)),
           all(len(be._candidates[i]) == expect for i in range(len(cfg.slots))),
           "槽位0候选=%s" % ([b for b, _ in c0],))
 

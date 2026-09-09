@@ -265,7 +265,7 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId","apiBase"(可选,字符串或数组),"proxyToken"(可选,字符串或数组)}]`；分摊 1 msg/s 流控。`apiBase`/`proxyToken` 缺省时回退全局变量；`apiBase` 写成数组即「该 bot 走多个 TG 代理」 | 空 |
 | `TG_API_BASE` | 全局 Telegram API 代理基址（国内/被墙用），作为各 bot 未单独指定 `apiBase` 时的默认回退 | `https://api.telegram.org` |
 | `TG_PROXY_TOKEN` | 全局代理鉴权令牌，以 `Authorization: Bearer` 头发出，作为各 bot 未单独指定 `proxyToken` 时的默认回退；官方 API 场景留空 | 空 |
-| `TG_PROXY_POOLS` | 全局代理候选池（所有 bot 共享），JSON 数组：字符串数组 `["https://p1/tg","https://p2/tg"]` 或对象数组 `[{"apiBase":"https://p1/tg","proxyToken":"t1"},...]`；与每 bot 自带 `apiBase` 合并成候选列表，按序主备 + 失败自动切换（见下方「多个 TG 代理」）。**不会**顶掉 `TG_API_BASE`——主代理始终作为兜底候选保留 | 空 |
+| `TG_PROXY_POOLS` | 全局代理候选池（所有 bot 共享），JSON 数组：字符串数组 `["https://p1/tg","https://p2/tg"]` 或对象数组 `[{"apiBase":"https://p1/tg","proxyToken":"t1"},...]`；与每 bot 自带 `apiBase` 合并成候选列表，按序主备 + 失败自动切换（见下方「多个 TG 代理」）。配了它**不会**顶掉 `TG_API_BASE`——主代理始终作为兜底候选保留；反过来，不配 `TG_API_BASE` 也不会凭空多出 `api.telegram.org` 候选 | 空 |
 | `CHUNK_SIZE_MB` | 分片大小（≤20 即可走官方 Bot API；自建 Bot API Server 可到 2000） | `20` |
 | `DB_PATH` | SQLite 文件路径 | `./telegram_webdav.db` |
 | `DAV_USER` / `DAV_PASSWORD` | Basic 认证（建议必填） | 空（关闭认证） |
@@ -369,30 +369,37 @@ docker run -d --name tg-webdav \
 
 ### 多个 TG 代理（主备 + 容灾切换）
 
-手上不止一个 TG 代理时，把额外的配进 `TG_PROXY_POOLS`，某个代理挂了会自动退到下一个：
+手上不止一个 TG 代理时，全部写进 `TG_PROXY_POOLS` 就行，某个代理挂了会自动退到下一个。
+**推荐这种「只配池」的写法**，`TG_API_BASE` / `TG_PROXY_TOKEN` 都不用单独写：
 
 ```bash
--e TG_API_BASE=https://tg.example.com/tg \
--e TG_PROXY_TOKEN=xxxxxxxx \
--e 'TG_PROXY_POOLS=[{"apiBase":"https://otterhub-tg-proxy-3uj.pages.dev/tg","proxyToken":"<该代理自己的令牌>"},
-                     {"apiBase":"https://tg-proxy-b4t.pages.dev/tg","proxyToken":"<该代理自己的令牌>"}]'
+-e 'TG_PROXY_POOLS=[{"apiBase":"https://otterhub-tg-proxy-3uj.pages.dev/tg","proxyToken":"xxxx"},
+                     {"apiBase":"https://tg-proxy-b4t.pages.dev/tg","proxyToken":"xxxx"},
+                     {"apiBase":"https://tg.totootao.top/tg","proxyToken":"xxxx"}]'
 ```
 
-池里可以放任意多个，按数组顺序依次做后备。`proxyToken` 省略则复用全局 `TG_PROXY_TOKEN`；
-像 OtterHub 这类公开代理并不校验令牌，填不填都能通。
+池里放几个就有几个候选，按数组顺序依次做后备。想让所有代理共用一个令牌，也可以写
+字符串数组形式 `TG_PROXY_POOLS='["https://p1/tg","https://p2/tg"]'`，此时各代理复用全局
+`TG_PROXY_TOKEN`。像 OtterHub 这类公开代理并不校验令牌，填不填都能通。
 
 候选顺序与语义：
 
 | 顺序 | 来源 | 说明 |
 | --- | --- | --- |
 | ① | bot 自带的 `apiBase`（`TG_BOT_POOLS` 里每项可配，支持数组） | 每 bot 独立指定 |
-| ② | `TG_PROXY_POOLS` | 全局共享的额外候选 |
-| ③ | `TG_API_BASE` + `TG_PROXY_TOKEN` | **始终追加**的兜底候选（与前面重复则去重） |
+| ② | `TG_PROXY_POOLS` | 全局共享的候选池 |
+| ③ | `TG_API_BASE` + `TG_PROXY_TOKEN` | **显式配过才追加**的兜底候选（与前面重复则去重） |
 
-> ③ 这一条容易踩坑：早期版本写的是「只有列表为空才追加全局默认」，结果配了
-> `TG_PROXY_POOLS` 之后 `TG_API_BASE` 里配的主代理被整个丢掉——想「多一个备用」，
-> 实际变成「换掉主用」。现在修成始终追加，日志里可以看到
-> `代理候选数=3 首候选=...`（池里 2 个 + 全局兜底 1 个）。
+> ③ 这一条前后踩过两个坑，都修了：
+>
+> - 早期写的是「只有列表为空才追加全局默认」，结果配了 `TG_PROXY_POOLS` 之后
+>   `TG_API_BASE` 里配的主代理被整个丢掉——想「多一个备用」变成「换掉主用」。
+> - 改成「始终追加」后又冒出反向的坑：完全不配 `TG_API_BASE` 时它默认是
+>   `api.telegram.org`，凭空成为最后一个候选。国内网络下那是黑洞，连接超时 180s，
+>   代理全挂时会把「几秒报错」拖成「卡十几分钟」。
+>
+> 现在的规则是**只认显式配置**：没写 `TG_API_BASE` 就不追加默认值（除非池也是空的，
+> 那时总得有个候选）。启动日志里 `api_base_explicit=off` 就是这个状态。
 
 语义是**按序主备**，不是轮询分摊：正常请求永远走候选 ①，只有它出现网络错误、
 超时或 5xx 才退到下一个；429（bot 级限流）和 4xx 业务错误不会换代理，
@@ -401,8 +408,11 @@ docker run -d --name tg-webdav \
 启动时会为每个 bot 打印候选，照着核对最省事：
 
 ```
+[tg] TelegramBackend 初始化: ... global_proxy_pools=3 api_base_explicit=off
 [tg]   槽位 0: chat_id=-1001549117195 代理候选数=3 首候选=https://otterhub-tg-proxy-3uj.pages.dev/tg
 ```
+
+照着 `代理候选数` 和 `api_base_explicit` 核对最省事。
 
 换代理前后的实测（2026-09-09，同一个 20MB 分片取前 8MB，各 2 轮）：
 
@@ -417,7 +427,7 @@ docker run -d --name tg-webdav \
 
 回归测试（含「首候选不可达时自动切换且数据一致」「全部候选不可达必须报错」）：
 ```bash
-source <容器 TG_*/DAV_* 环境变量> && python3.11 proxy_failover_test.py   # 10/10
+source <容器 TG_*/DAV_* 环境变量> && python3.11 proxy_failover_test.py   # 12/12
 ```
 
 ### 多 bot 池的分片分配

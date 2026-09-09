@@ -2005,6 +2005,7 @@ class App:
                 self.config.slots, self.config.api_base, self.config.rate_limit,
                 self.config.proxy_token, self.config.slot_rotate,
                 self.config.proxy_pools,
+                self.config.api_base_explicit,
             )
             if self.config.slots
             else None
