@@ -94,9 +94,11 @@ def test_b_real():
                          proxy_token=cfg.proxy_token, proxy_pools=cfg.proxy_pools,
                          rate_limit=0, rotate=cfg.slot_rotate)
     c0 = be._candidates[0]
-    check("B1 生产配置下每个 bot 都有 2 个代理候选",
-          all(len(be._candidates[i]) == 2 for i in range(len(cfg.slots)))
-          and len(c0) == 2, "槽位0候选=%s" % (c0,))
+    expect = len(cfg.proxy_pools) + 1  # 池里的候选 + 全局默认兜底
+    check("B1 生产配置下每个 bot 都有 %d 个代理候选（池 %d + 全局兜底 1）"
+          % (expect, len(cfg.proxy_pools)),
+          all(len(be._candidates[i]) == expect for i in range(len(cfg.slots))),
+          "槽位0候选=%s" % ([b for b, _ in c0],))
 
     def _read(cands, slot=0):
         be._candidates[0] = cands

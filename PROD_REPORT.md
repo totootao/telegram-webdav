@@ -1,6 +1,6 @@
 # 生产环境（真实 Telegram）测试报告
 
-- 测试时间：2026-09-09 16:30:17
+- 测试时间：2026-09-09 16:42:12
 - 服务地址：`http://127.0.0.1:10010`（容器 tg-webdav，5 bot 池 + 自建 TG 代理）
 - 主测试文件：`60MB`（按 20MB 分片 → 3 片，真实上传/下载）
 - 卡顿阈值：单次等待 >300ms；严重卡顿 >1s
@@ -11,18 +11,18 @@
 | 指标 | 数值 |
 |---|---|
 | 上传 60MB | 0.00s (-) |
-| 全量下载 | 22.57s (2.66 MB/s) |
-| 起播吞吐 | 3.94 MB/s |
-| seek 吞吐 | 3.35 MB/s |
-| 平均吞吐 | 3.30 MB/s |
+| 全量下载 | 6.28s (9.55 MB/s) |
+| 起播吞吐 | 8.13 MB/s |
+| seek 吞吐 | 7.95 MB/s |
+| 平均吞吐 | 8.84 MB/s |
 
 ## 播放平滑度（真实带宽）
 
 | 场景 | TTFB | 最大等待 | p95 | 卡顿>300ms | 严重>1s | 吞吐 |
 |---|---|---|---|---|---|---|
-| 起播 bytes=0- | 589ms | 1395ms | 88ms | 11次 | 2次 | 3.94MB/s |
-| seek 60% | 871ms | 941ms | 107ms | 3次 | 0次 | 3.35MB/s |
-| 全量(无Range) | 1474ms | 1400ms | 151ms | 16次 | 2次 | 2.66MB/s |
+| 起播 bytes=0- | 564ms | 777ms | 13ms | 9次 | 0次 | 8.13MB/s |
+| seek 60% | 563ms | 566ms | 13ms | 3次 | 0次 | 7.95MB/s |
+| 全量(无Range) | 927ms | 760ms | 8ms | 5次 | 0次 | 9.55MB/s |
 
 ## 详细用例
 
@@ -42,6 +42,6 @@
 | playback.start(206) | PASS | status=206 |
 | playback.start.bytes_ok | PASS | len=62914560 |
 | playback.seek(206) | PASS | status=206 len=25165824 |
-| concurrent.ranges.all_206 | PASS | ok=4/4 err={} wall=12.30s |
+| concurrent.ranges.all_206 | PASS | ok=4/4 err={} wall=6.22s |
 | resume.from_half(206) | PASS | status=206 len=31457280 |
 | get.empty(200_zero) | PASS | status=200 len=0 |

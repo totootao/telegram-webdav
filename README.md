@@ -374,8 +374,12 @@ docker run -d --name tg-webdav \
 ```bash
 -e TG_API_BASE=https://tg.example.com/tg \
 -e TG_PROXY_TOKEN=xxxxxxxx \
--e 'TG_PROXY_POOLS=[{"apiBase":"https://otterhub-tg-proxy-3uj.pages.dev/tg","proxyToken":"<该代理自己的令牌>"}]'
+-e 'TG_PROXY_POOLS=[{"apiBase":"https://otterhub-tg-proxy-3uj.pages.dev/tg","proxyToken":"<该代理自己的令牌>"},
+                     {"apiBase":"https://tg-proxy-b4t.pages.dev/tg","proxyToken":"<该代理自己的令牌>"}]'
 ```
+
+池里可以放任意多个，按数组顺序依次做后备。`proxyToken` 省略则复用全局 `TG_PROXY_TOKEN`；
+像 OtterHub 这类公开代理并不校验令牌，填不填都能通。
 
 候选顺序与语义：
 
@@ -388,7 +392,7 @@ docker run -d --name tg-webdav \
 > ③ 这一条容易踩坑：早期版本写的是「只有列表为空才追加全局默认」，结果配了
 > `TG_PROXY_POOLS` 之后 `TG_API_BASE` 里配的主代理被整个丢掉——想「多一个备用」，
 > 实际变成「换掉主用」。现在修成始终追加，日志里可以看到
-> `代理候选数=2 首候选=...`。
+> `代理候选数=3 首候选=...`（池里 2 个 + 全局兜底 1 个）。
 
 语义是**按序主备**，不是轮询分摊：正常请求永远走候选 ①，只有它出现网络错误、
 超时或 5xx 才退到下一个；429（bot 级限流）和 4xx 业务错误不会换代理，
@@ -397,8 +401,19 @@ docker run -d --name tg-webdav \
 启动时会为每个 bot 打印候选，照着核对最省事：
 
 ```
-[tg]   槽位 0: chat_id=-1001549117195 代理候选数=2 首候选=https://otterhub-tg-proxy-3uj.pages.dev/tg
+[tg]   槽位 0: chat_id=-1001549117195 代理候选数=3 首候选=https://otterhub-tg-proxy-3uj.pages.dev/tg
 ```
+
+换代理前后的实测（2026-09-09，同一个 20MB 分片取前 8MB，各 2 轮）：
+
+| 代理 | 轮 1 | 轮 2 | 说明 |
+| --- | --- | --- | --- |
+| `otterhub-tg-proxy-3uj.pages.dev` | 2.94 MB/s | 3.88 MB/s | 现主用 |
+| `tg-proxy-b4t.pages.dev` | 2.94 MB/s | 2.67 MB/s | 本次新增，次选 |
+| `tg.totootao.top` | 1.26 MB/s | 0.94 MB/s | 原主用，现兜底 |
+
+三个代理都正确返回 `206 + Content-Range`，同区间取下的字节 MD5 完全一致
+（`ed1c615f…`），可以放心互为备份。注意速度随时段波动很大，隔一阵子重测可能排名会变。
 
 回归测试（含「首候选不可达时自动切换且数据一致」「全部候选不可达必须报错」）：
 ```bash
