@@ -29,6 +29,7 @@ import concurrent.futures
 import email.utils
 import hashlib
 import json
+import os
 import re
 import select
 import socket
@@ -142,6 +143,29 @@ _MEDIA_TAIL_SAMPLE = 4 * 1024 * 1024
 # 上传走「流式边收边传」的大小门槛：超过它就不把整个请求体读进内存。
 # 旧路径对 1.2GB 文件的实测内存峰值是 2743MB（2.27 倍），2GB 文件足以撑爆普通容器。
 _STREAM_UPLOAD_MIN_BYTES = 32 * 1024 * 1024
+
+# 大请求（PUT/GET）结束后把 glibc 堆中已 free 的内存还给 OS。
+# 背景：20MB 分片走 malloc 直接分配（大于 pymalloc 阈值），free 后 glibc 未必
+# 归还 OS——实测 150MB 上传后 RSS 常驻 378~758MB 不回落，监控误判为泄漏。
+# malloc_trim(0) 强制归还，非 glibc 平台静默退化为 no-op。
+try:
+    import ctypes as _ctypes
+    _libc_trim = _ctypes.CDLL("libc.so.6").malloc_trim
+    _libc_trim.restype = _ctypes.c_int
+    _libc_trim.argtypes = [_ctypes.c_size_t]
+except Exception:
+    _libc_trim = None
+
+_TRIM_AFTER_BYTES = 32 * 1024 * 1024
+
+
+def _maybe_trim(nbytes=_TRIM_AFTER_BYTES):
+    """传输量超过阈值时调用 malloc_trim；失败一律忽略（纯收益型优化）。"""
+    if _libc_trim is not None and nbytes >= 0:
+        try:
+            _libc_trim(0)
+        except Exception:
+            pass
 
 # 单个分片上传失败后，在 webdav 层重试的次数。
 #
@@ -453,6 +477,10 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         ctx = self._ctx
         if ctx is None:
             return None
+        # 每请求收尾都尝试把 glibc 堆里已 free 的内存还给 OS。
+        # 不能只在大请求后做：并发小请求（如 8×8MB）单个不达阈值但累计可观，
+        # 实测会造成 RSS 常驻 293MB 不回落。trim 是微秒级调用，文件服务 QPS 低，开销可忽略。
+        _maybe_trim(0)
         if not self._hdr_status:
             # 未产生响应（超时/中断）：描述已由超时日志写好，不覆盖
             return None
@@ -1048,7 +1076,8 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         results = [None] * n_chunks
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
             fut_map = {
-                ex.submit(_one_retry, i, body_data[i * chunk_size:(i + 1) * chunk_size]): i
+                # memoryview 切片避免 bytes 切片的中间拷贝（bytes() 从 view 单次成型）
+                ex.submit(_one_retry, i, bytes(memoryview(body_data)[i * chunk_size:(i + 1) * chunk_size])): i
                 for i in range(n_chunks)
             }
             for fut in concurrent.futures.as_completed(fut_map):
@@ -1100,7 +1129,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         """
         n_chunks = (total + chunk_size - 1) // chunk_size if total > 0 else 0
         workers = self.app.config._upload_workers(len(self.app.backend.slots))
-        max_inflight = max(2, workers * 2)
+        # 在飞分片上限：默认 并发数+2（原 2×并发）。TG 侧每 bot 1 msg/s 流控下，
+        # 并发数本身就够喂满；多垫 2 片用于掩盖 getFile/响应 RTT。10 片×20MB=200MB
+        # 的旧上限对内存敏感的容器偏大（8 分片文件会整体在飞）。可用
+        # TG_UPLOAD_INFLIGHT 显式覆盖；0/未设 = 用默认 workers+2。
+        env_inflight = int(os.environ.get("TG_UPLOAD_INFLIGHT") or 0)
+        max_inflight = env_inflight if env_inflight > 0 else max(2, workers + 2)
         dedup_on = getattr(self.app.config, "chunk_dedup", True)
         _log(f"PUT 流式上传启动: 分片数={n_chunks} 并发线程={workers} "
              f"在飞上限={max_inflight} 分片大小={chunk_size // 1024 // 1024}MB "
@@ -1163,7 +1197,10 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             for block in body_iter:
                 buf += block
                 while len(buf) >= chunk_size and ci < n_chunks:
-                    piece = bytes(buf[:chunk_size])
+                    # memoryview 切片不复制，bytes() 从 view 单次拷贝——
+                    # 原写法 buf[:chunk_size] 先复制一份 bytearray、bytes() 再复制一份，
+                    # 每个 20MB 分片瞬时多占 20MB。
+                    piece = bytes(memoryview(buf)[:chunk_size])
                     del buf[:chunk_size]
                     file_hash.update(piece)          # 顺序：整文件哈希与整算一致
                     if ci == 0:
@@ -1175,7 +1212,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
                             pending, return_when=concurrent.futures.FIRST_COMPLETED)
                         _harvest(done)
             if ci < n_chunks and buf:                # 最后一片（不足 chunk_size）
-                piece = bytes(buf)
+                piece = bytes(memoryview(buf))       # 同上：单次拷贝
                 file_hash.update(piece)
                 if ci == 0:
                     head_sample = piece[:head_sample_size]
@@ -1646,6 +1683,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
              f"(卡顿指标:≈0表示分片平滑衔接) "
              f"类型={_media_kind(content_type, path.rsplit('/', 1)[-1])} "
              f"时长={_fmt_dur(dur)}")
+        _maybe_trim(sent)
 
     # ---------------- PUT ----------------
     def do_PUT(self):
@@ -1832,6 +1870,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
              f"{'(' + f'{duration:.3f}s' + ')' if duration is not None else ''} "
              f"耗时={time.time() - t0:.2f}s 吞吐={_fmt_speed(total, time.time() - t0)} "
              f"file_hash={'有' if total > 0 else '无(空文件)'}")
+        _maybe_trim(total)
         self._send(204 if existed else 201, {"Content-Type": "text/plain"})
 
     # ---------------- DELETE ----------------

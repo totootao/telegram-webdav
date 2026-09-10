@@ -107,6 +107,28 @@ _CONN_WARM_INTERVAL = float(os.environ.get("TG_CONN_WARM_INTERVAL", "2") or 2)
 # 黑洞代理最多阻塞 30s × 重试次数，而不是 18 分钟。
 _DEFAULT_HTTP_TIMEOUT = 30.0
 
+# sendDocument（分片上传）的 socket 超时（秒），可用 TG_HTTP_TIMEOUT 调整。
+# 为什么默认 60s（原 240s）：真实压测发现代理/TG 偶发把单个 sendDocument「挂起」
+# ——不报错、不响应，同 bot 的后续分片被队头阻塞，实测单片最长卡 246s（8 分片文件
+# 总耗时从 ~15s 恶化到 247s）。socket 超时只兜「完全无数据」的挂起，60s 对
+# 正常代理（实测单片 5~10s）足够宽裕；挂起片到点即抛，走换代理/换 bot 重传，
+# 最坏损失是一片的时间，而不是整个上传卡 4 分钟。
+# 注意：慢速但持续滴字节的响应不受此超时影响（socket 超时按「单次读/写间隔」计）。
+_HTTP_TIMEOUT = float(os.environ.get("TG_HTTP_TIMEOUT", "60") or 60)
+
+
+def _is_timeout_err(e):
+    """识别「挂起/超时」类网络错误（socket 超时或被 URLError 包装的 timeout）。
+
+    这类错误与普通网络错误区别对待：同代理立即重试大概率再次挂起（队头阻塞还在），
+    应直接换下一个代理/bot。仅在下载数据已部分写出时不可换（由调用方保证）。
+    """
+    if isinstance(e, (socket.timeout, TimeoutError)):
+        return True
+    if isinstance(e, urllib.error.URLError):
+        return isinstance(getattr(e, "reason", None), (socket.timeout, TimeoutError))
+    return False
+
 
 def _http_code_of(msg):
     """从错误消息里提取 HTTP 状态码（如 'HTTP 429' / 'getFile: 403'）。"""
@@ -162,25 +184,37 @@ def _safe_filename(name):
 
 
 def _build_multipart(boundary, fields, files):
-    """构造 multipart/form-data 请求体。fields=[(name,value)], files=[(name,fname,ctype,data)]。"""
+    """构造 multipart/form-data 请求体。fields=[(name,value)], files=[(name,fname,ctype,data)]。
+
+    内存要点：用 parts 列表最后 ``b"".join`` 一次成型，而不是 ``body += data`` 逐段拼接。
+    bytes 不可变，``body += crlf + data + crlf`` 会先复制出一份 20MB 的 ``crlf+data+crlf``
+    临时对象、再复制一份拼接结果——单个 20MB 分片的瞬时内存从 2 份涨到 3 份；
+    8 分片并发时实测把进程 RSS 推到 758MB。join 方式瞬时只有 data + 结果两份（省 ~20MB/片）。
+    """
     if isinstance(boundary, str):
         boundary = boundary.encode()
     crlf = b"\r\n"
-    body = b""
+    parts = []
     for name, value in fields:
-        body += b"--" + boundary + crlf
-        body += b'Content-Disposition: form-data; name="' + name.encode() + b'"' + crlf
-        body += crlf + str(value).encode() + crlf
-    for name, fname, ctype, data in files:
-        body += b"--" + boundary + crlf
-        body += (
-            b'Content-Disposition: form-data; name="' + name.encode()
-            + b'"; filename="' + fname.encode() + b'"' + crlf
+        parts.append(
+            b"--" + boundary + crlf
+            + b'Content-Disposition: form-data; name="' + name.encode() + b'"' + crlf
+            + crlf + str(value).encode() + crlf
         )
-        body += b"Content-Type: " + ctype.encode() + crlf
-        body += crlf + data + crlf
-    body += b"--" + boundary + b"--" + crlf
-    return body
+    for name, fname, ctype, data in files:
+        parts.append(
+            b"--" + boundary + crlf
+            + (
+                b'Content-Disposition: form-data; name="' + name.encode()
+                + b'"; filename="' + fname.encode() + b'"' + crlf
+            )
+            + b"Content-Type: " + ctype.encode() + crlf
+            + crlf
+        )
+        parts.append(data)          # 直接引用原缓冲，不复制
+        parts.append(crlf)
+    parts.append(b"--" + boundary + b"--" + crlf)
+    return b"".join(parts)
 
 
 class TelegramBackend:
@@ -263,6 +297,12 @@ class TelegramBackend:
         """
         while not self._warm_stop:
             try:
+                # 空闲降频：无请求超过 5 分钟后，巡检间隔从 2s 放宽到 60s。
+                # 线程仍每 2s 醒一次空转（判断后 continue）纯属 CPU 空转唤醒；
+                # 直接把 sleep 拉长，空闲期 CPU 唤醒从 0.5 次/秒降到 1 次/分钟。
+                if time.time() - self._last_activity > 300:
+                    time.sleep(60.0)
+                    continue
                 time.sleep(_CONN_WARM_INTERVAL)
                 if time.time() - self._last_activity > 300:
                     continue
@@ -685,8 +725,11 @@ class TelegramBackend:
         last = None
         for attempt in range(retries):
             try:
-                with urllib.request.urlopen(req, timeout=240) as resp:
+                t_req = time.time()
+                with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:
                     raw = resp.read().decode("utf-8", "replace")
+                _log(f"sendDocument 响应: file={file_name!r} 耗时={time.time() - t_req:.2f}s "
+                     f"api={api_base}")
                 try:
                     js = json.loads(raw)
                 except json.JSONDecodeError as e:
@@ -740,6 +783,15 @@ class TelegramBackend:
                 raise
             except Exception as e:  # 网络错误：退避重试
                 last = f"network: {e}"
+                # 挂起/超时单独处理：同代理立即重试大概率再次挂起（队头阻塞仍在），
+                # 直接抛给 _send_document 换下一个代理候选 / upload_chunk 换 bot。
+                # 实测案例：某 bot 的 sendDocument 被代理挂 166s/246s，期间同 bot
+                # 后续分片全部排队——快速切换能把单片最坏耗时从 246s 压到 60s。
+                if _is_timeout_err(e):
+                    last = f"timeout({int(_HTTP_TIMEOUT)}s): {e}"
+                    _log(f"sendDocument 挂起超时({int(_HTTP_TIMEOUT)}s): "
+                         f"file={file_name!r} api={api_base} 换代理/换bot重传")
+                    raise TGError(last)
                 _log(f"sendDocument 网络错误: {type(e).__name__}: {e} attempt={attempt + 1}/{retries} "
                      f"api={api_base}")
                 if attempt < retries - 1:
