@@ -445,23 +445,25 @@ class TelegramBackend:
                     dq.popleft()
                     evicted += 1
                     continue
-                # 3) 探活：MSG_PEEK 读 1 字节，EOF = 已关闭。
+                # 3) 探活：空闲的 keep-alive 连接**不该有任何可读数据**。
+                #    只要 select 报可读就丢弃：那说明上一个响应的 body 没读完（残留字节），
+                #    复用它会让下一个请求读到上一段的尾巴 → 静默数据错位（长度还对、
+                #    SHA 却不对）。旧写法是「PEEK 到 EOF 才丢」，把「有残留数据」误判成健康，
+                #    正是这种最难查的错位的温床。
                 try:
                     sock = getattr(conn, "sock", None)
                     if sock is not None:
                         import select as _select
                         rd, _, _ = _select.select([sock], [], [], 0)
                         if rd:
-                            buf = sock.recv(1, _select.MSG_PEEK)
-                            if not buf:
-                                # 服务端已 FIN，丢弃
-                                try:
-                                    conn.close()
-                                except Exception:
-                                    pass
-                                dq.popleft()
-                                evicted += 1
-                                continue
+                            # 有数据可读 = 脏连接（残留 body 或服务端已 FIN）
+                            try:
+                                conn.close()
+                            except Exception:
+                                pass
+                            dq.popleft()
+                            evicted += 1
+                            continue
                 except Exception:
                     # 探活本身失败 = 连接坏，丢弃
                     try:
