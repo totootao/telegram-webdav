@@ -265,6 +265,8 @@ python3 run.py              # 或 python3 -m server / python3 server.py
 | `TG_BOT_POOLS` | 多 bot 池，JSON 数组 `[{"token","chatId","apiBase"(可选,字符串或数组),"proxyToken"(可选,字符串或数组)}]`；分摊 1 msg/s 流控。`apiBase`/`proxyToken` 缺省时回退全局变量；`apiBase` 写成数组即「该 bot 走多个 TG 代理」 | 空 |
 | `TG_API_BASE` | 全局 Telegram API 代理基址（国内/被墙用），作为各 bot 未单独指定 `apiBase` 时的默认回退 | `https://api.telegram.org` |
 | `TG_PROXY_TOKEN` | 全局代理鉴权令牌，以 `Authorization: Bearer` 头发出，作为各 bot 未单独指定 `proxyToken` 时的默认回退；官方 API 场景留空 | 空 |
+| `TG_PROXY_LB` | 代理/优选 IP 负载均衡开关：`off`（默认，现有「按序主备 + 失败切换」，行为零变化）/ `fastest`（EWMA 吞吐择优，推荐）/ `weighted`（按吞吐加权随机）/ `rr`（严格轮询，仅当各 IP 速度接近时用）。见下方「优选 IP 负载均衡」 | `off` |
+| `TG_PROXY_IPS` | 优选 IP 映射：`域名=IP1,IP2;域名2=IP3`，或只给 `IP1,IP2` 作用于所有代理域名。仅在 `TG_PROXY_LB!=off` 时生效 | 空 |
 | `TG_PROXY_POOLS` | 全局代理候选池（所有 bot 共享），JSON 数组：字符串数组 `["https://p1/tg","https://p2/tg"]` 或对象数组 `[{"apiBase":"https://p1/tg","proxyToken":"t1"},...]`；与每 bot 自带 `apiBase` 合并成候选列表，按序主备 + 失败自动切换（见下方「多个 TG 代理」）。配了它**不会**顶掉 `TG_API_BASE`——主代理始终作为兜底候选保留；反过来，不配 `TG_API_BASE` 也不会凭空多出 `api.telegram.org` 候选 | 空 |
 | `CHUNK_SIZE_MB` | 分片大小（≤20 即可走官方 Bot API；自建 Bot API Server 可到 2000） | `20` |
 | `DB_PATH` | SQLite 文件路径 | `./telegram_webdav.db` |
@@ -413,6 +415,54 @@ docker run -d --name tg-webdav \
 ```
 
 照着 `代理候选数` 和 `api_base_explicit` 核对最省事。
+
+### 优选 IP 负载均衡（默认关闭）
+
+上面那套候选只有「域名」这一层，没法表达「同一个域名走不同 IP」。而实测里真正
+拉开差距的恰恰是 IP：同一批 Cloudflare 优选 IP，单车道吞吐能差 20 倍
+（23.2 / 6.2 / 2.6 / 1.1 MB/s）。`TG_PROXY_LB` 打开后，候选会被展开成
+「域名 × IP」，并按实测吞吐择优。
+
+实现上是 **TCP 连指定 IP、SNI / 证书校验 / Host 头仍用原域名**——Cloudflare
+Pages / Workers 按 SNI 路由，所以这样能正确落到同一个项目上。等价于给容器加
+`--add-host`，但好处是可以在运行时按实测结果换 IP，不用重启。
+
+```bash
+-e TG_PROXY_LB=fastest \
+-e 'TG_PROXY_IPS=tg-proxy-b4t.pages.dev=155.117.224.63;otterhub-tg-proxy-3uj.pages.dev=43.175.131.30;tg.totootao.top=209.33.166.199'
+```
+
+四种模式的取舍：
+
+| 模式 | 做法 | 什么时候用 |
+| --- | --- | --- |
+| `off` | 按序主备 + 失败切换（**默认，与不开完全一致**） | 不确定就先用这个 |
+| `fastest` | 选 EWMA 吞吐最高的健康路由，带在途惩罚（并发自动铺开到次快车道） | **推荐**，IP 速度差异大时收益最大 |
+| `weighted` | 按 EWMA 吞吐加权随机 | 多车道并发、想要平滑分摊 |
+| `rr` | 严格轮询 | 只在几个 IP 速度**差不多**时用；速度不均时会把请求均分到慢 IP |
+
+几个已经踩过并修掉的点：
+
+- **冷启动不能锁在第一条**：若「没样本就按配置顺序」，第一条会一直被选、其余路由
+  永远拿不到样本，择优永久退化成「只走配置里第一条」。`fastest` 用 ε-greedy
+  （`TG_PROXY_LB_EXPLORE`，默认 0.1）探索，`weighted` 在无样本时等概率随机，
+  没测过的路由给「等于当前均值」的乐观先验而不是 0 权重。
+- **小请求不参与吞吐统计**：`getFile` 只有几百字节，一次 RTT 抖动就能算出
+  「几百 B/s」，足以把一条好路由的 EWMA 打死。默认小于 256KB 的请求只更新延迟、
+  不更新吞吐（`TG_PROXY_LB_MIN_BYTES`）。
+- **429 / 4xx 不算这条路由的锅**：它们是 bot 级或请求级问题，换 IP 没用，
+  计入健康度只会误杀（`neutral` 标记，只减在途）。
+- **坏 IP 别刷爆日志**：连接预热线程对坏路由每 2s 握手一次，同一路由 60s 内
+  最多打一条日志；正在冷却的路由直接跳过预热。
+- **全在冷却时按配置顺序全量返回**：选路此时已无意义，保持确定性与「绝不比关掉更差」。
+
+排查「为什么总走这个 IP」看启动日志的 `proxy_lb=` 一行和运行中的
+`代理路由统计:`（默认每 100 次选路打一条，`TG_PROXY_LB_LOG_EVERY` 可调）：
+
+```
+[tg] proxy_lb=fastest ips=3 penalty=0.5 explore=0.1 cooldown=60.0s keep_dns=on min_bytes=262144
+[tg] 代理路由统计: lb[fastest] otterhub-...@43.175.131.30:tp=6.3MB/s ok=4 fail=0 | tg.totootao.top@209.33.166.199:tp=2.2MB/s ok=3 fail=0
+```
 
 换代理前后的实测（2026-09-09，同一个 20MB 分片取前 8MB，各 2 轮）：
 

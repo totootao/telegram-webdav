@@ -34,6 +34,11 @@ def check(name, cond, detail=""):
           + name + (("  -> " + detail) if detail else ""))
 
 
+def _pairs(cands):
+    """候选去掉第三项（优选 IP）。off 模式下第三项恒为 None，由 A8/A9 单独断言。"""
+    return [(a, b) for (a, b, *_ip) in cands]
+
+
 def _mk(api_base, proxy_token, pools, slots=None, api_base_explicit=True):
     slots = slots if slots is not None else [{"token": "T", "chat_id": "C"}]
     return TelegramBackend(slots=slots, api_base=api_base, proxy_token=proxy_token,
@@ -49,29 +54,29 @@ def test_a_build():
     b = _mk(GLOBAL_BASE, tok, [])
     c = b._build_candidates(b.slots[0])
     check("A1 未配 TG_PROXY_POOLS：候选=[全局默认]",
-          c == [(GLOBAL_BASE, tok)], str(c))
+          _pairs(c) == [(GLOBAL_BASE, tok)], str(c))
 
     b = _mk(GLOBAL_BASE, tok, [(POOL_BASE, ptok)])
     c = b._build_candidates(b.slots[0])
     check("A2 配了 TG_PROXY_POOLS：全局默认仍保留在候选里（本次修复的回归点）",
-          c == [(POOL_BASE, ptok), (GLOBAL_BASE, tok)], str(c))
+          _pairs(c) == [(POOL_BASE, ptok), (GLOBAL_BASE, tok)], str(c))
 
     b = _mk(GLOBAL_BASE, tok, [(GLOBAL_BASE, tok)])
     c = b._build_candidates(b.slots[0])
     check("A3 池里配的和全局默认相同：去重后只有 1 个",
-          c == [(GLOBAL_BASE, tok)], str(c))
+          _pairs(c) == [(GLOBAL_BASE, tok)], str(c))
 
     b = _mk(GLOBAL_BASE, tok, [(POOL_BASE, ptok)])
     c = b._build_candidates({"token": "T", "chat_id": "C",
                              "api_base": "https://slot-only.example/tg"})
     check("A4 槽位自带 apiBase：自带在前，池次之，全局默认兜底",
-          c == [("https://slot-only.example/tg", tok), (POOL_BASE, ptok),
+          _pairs(c) == [("https://slot-only.example/tg", tok), (POOL_BASE, ptok),
                 (GLOBAL_BASE, tok)], str(c))
 
     b = _mk(GLOBAL_BASE, tok, [(POOL_BASE, ptok)])
     c = b._build_candidates({"token": "T", "chat_id": "C", "api_base": GLOBAL_BASE})
     check("A5 槽位自带 == 全局默认：结尾不再重复追加",
-          c == [(GLOBAL_BASE, tok), (POOL_BASE, ptok)], str(c))
+          _pairs(c) == [(GLOBAL_BASE, tok), (POOL_BASE, ptok)], str(c))
 
     # 只配 TG_PROXY_POOLS、不配 TG_API_BASE 的用法（docker run 想省掉那两行 -e）
     b = _mk("https://api.telegram.org", None, [(POOL_BASE, None), (GLOBAL_BASE, tok)],
@@ -79,12 +84,33 @@ def test_a_build():
     c = b._build_candidates(b.slots[0])
     check("A6 未显式配 TG_API_BASE：不把默认的 api.telegram.org 塞进候选"
           "（否则它是黑洞，全挂时会卡满 180s 超时）",
-          c == [(POOL_BASE, None), (GLOBAL_BASE, tok)], str(c))
+          _pairs(c) == [(POOL_BASE, None), (GLOBAL_BASE, tok)], str(c))
 
     b = _mk("https://api.telegram.org", None, [], api_base_explicit=False)
     c = b._build_candidates(b.slots[0])
     check("A7 未显式配且池也为空：仍保留默认兜底，不能出现零候选",
-          c == [("https://api.telegram.org", None)], str(c))
+          _pairs(c) == [("https://api.telegram.org", None)], str(c))
+
+    # --- 优选 IP / 负载均衡（默认必须关闭 = 与上面 A1~A7 完全一致的旧行为）---
+    os.environ.pop("TG_PROXY_LB", None)
+    os.environ.pop("TG_PROXY_IPS", None)
+    b = _mk(GLOBAL_BASE, tok, [(POOL_BASE, ptok)])
+    c = b._build_candidates(b.slots[0])
+    check("A8 TG_PROXY_LB 未设置（默认 off）：第三项全是 None，TG_PROXY_IPS 被忽略",
+          [ip for (_a, _b, ip) in c] == [None] * len(c), str(c))
+
+    os.environ["TG_PROXY_LB"] = "fastest"
+    os.environ["TG_PROXY_IPS"] = (
+        "otterhub-tg-proxy-3uj.pages.dev=43.175.131.30,1.1.1.1"
+    )
+    b = _mk(GLOBAL_BASE, tok, [(POOL_BASE, ptok)])
+    c = b._build_candidates(b.slots[0])
+    check("A9 LB 开启：池里的域名被展开成 域名×IP（+ DNS 兜底）",
+          [(x[0], x[2]) for x in c] ==
+          [(POOL_BASE, "43.175.131.30"), (POOL_BASE, "1.1.1.1"),
+           (POOL_BASE, None), (GLOBAL_BASE, None)], str(c))
+    os.environ["TG_PROXY_LB"] = "off"
+    os.environ.pop("TG_PROXY_IPS", None)
 
 
 # ---------------------------------------------------------------- B 组：真实联网
