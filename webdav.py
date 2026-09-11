@@ -1365,20 +1365,29 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         只取首片：起播/打开文件的第一个字节就是它，是关键路径；
         其余分片在 GET 时由 prefetch_paths 并发预取（已在 _serve_file 中实现）。
+
+        首片信息优先读 first_file_id 冗余列（列目录已不再携带 chunks 大 JSON，
+        解析 JSON 的 CPU 开销也一并省掉）；旧数据回填失败时回退解析 chunks。
         """
         if not getattr(self.app.config, "warmup_propfind", True):
             return
         items = []
         for n in nodes:
-            if n.get("is_dir") or not n.get("chunks"):
+            if n.get("is_dir"):
                 continue
-            try:
-                cs = json.loads(n["chunks"])
-            except (ValueError, TypeError):
-                continue
-            if not cs:
-                continue
-            items.append((cs[0]["file_id"], cs[0].get("slot", 0)))
+            fid = n.get("first_file_id")
+            slot = n.get("first_slot") or 0
+            if not fid:
+                if not n.get("chunks"):
+                    continue
+                try:
+                    cs = json.loads(n["chunks"])
+                except (ValueError, TypeError):
+                    continue
+                if not cs:
+                    continue
+                fid, slot = cs[0]["file_id"], cs[0].get("slot", 0)
+            items.append((fid, slot))
             if len(items) >= self.app.config.warmup_max_files:
                 break
         if items:
@@ -1707,7 +1716,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
 
         # 条件头：If-None-Match: * 表示「仅当不存在时创建」
         if_none = self.headers.get("If-None-Match", "")
-        existed = self.app.db.get_node(path) is not None
+        existed = self.app.db.get_node(path, with_chunks=False) is not None
         if if_none == "*" and existed:
             _log(f"PUT 拒绝(412): 已存在且 If-None-Match:* path={path}")
             self._send(412, {"Content-Type": "text/plain; charset=utf-8"},
@@ -1715,7 +1724,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
 
         parent = "/" if path == "/" else path.rsplit("/", 1)[0] or "/"
-        pnode = self.app.db.get_node(parent)
+        pnode = self.app.db.get_node(parent, with_chunks=False)
         if pnode is None or not pnode["is_dir"]:
             _log(f"PUT 拒绝(409): 父目录不存在或非目录 path={path} parent={parent} "
                  f"parent_node={'缺失' if pnode is None else '存在但非目录'}")
@@ -1882,7 +1891,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         self._consume_body()  # AList 会给 DELETE 带 body，先读净
-        node = self.app.db.get_node(path)
+        node = self.app.db.get_node(path, with_chunks=False)
         if node is None:
             self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
@@ -1899,11 +1908,11 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
         self._consume_body()  # 读净可能的 body（部分客户端会发空 XML）
-        if self.app.db.get_node(path) is not None:
+        if self.app.db.get_node(path, with_chunks=False) is not None:
             self._send(405, {"Content-Type": "text/plain; charset=utf-8"})  # Method Not Allowed
             return
         parent = "/" if path == "/" else path.rsplit("/", 1)[0] or "/"
-        pnode = self.app.db.get_node(parent)
+        pnode = self.app.db.get_node(parent, with_chunks=False)
         if pnode is None or not pnode["is_dir"]:
             self._send(409, {"Content-Type": "text/plain; charset=utf-8"})
             return
@@ -1938,19 +1947,19 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if src == dst:
             self._send(403, {"Content-Type": "text/plain; charset=utf-8"}, b"403 Forbidden")
             return
-        if self.app.db.get_node(src) is None:
+        if self.app.db.get_node(src, with_chunks=False) is None:
             self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         if dst.startswith(src + "/"):
             self._send(423, {"Content-Type": "text/plain; charset=utf-8"})  # Locked: 不能移入自身子树
             return
-        dst_existed = self.app.db.get_node(dst) is not None
+        dst_existed = self.app.db.get_node(dst, with_chunks=False) is not None
         overwrite = (self.headers.get("Overwrite", "T").upper() != "F")
         if dst_existed and not overwrite:
             self._send(412, {"Content-Type": "text/plain; charset=utf-8"})  # Precondition Failed
             return
         parent = "/" if dst == "/" else dst.rsplit("/", 1)[0] or "/"
-        pnode = self.app.db.get_node(parent)
+        pnode = self.app.db.get_node(parent, with_chunks=False)
         if pnode is None or not pnode["is_dir"]:
             self._send(409, {"Content-Type": "text/plain; charset=utf-8"})
             return
@@ -2025,7 +2034,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if not self._require_auth():
             return
         path = self._normalize_path(self.path)
-        if path is None or self.app.db.get_node(path) is None:
+        if path is None or self.app.db.get_node(path, with_chunks=False) is None:
             self._send(404, {"Content-Type": "text/plain; charset=utf-8"}, b"404 Not Found")
             return
         self._consume_body()  # 接受死属性写入
@@ -2083,12 +2092,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             return
 
         base = cfg.import_dir
-        if self.app.db.get_node(base) is None:
+        if self.app.db.get_node(base, with_chunks=False) is None:
             self.app.db.create_dir(base)
         name = media["file_name"]
         dest = f"{base}/{name}"
         i = 1
-        while self.app.db.get_node(dest) is not None:
+        while self.app.db.get_node(dest, with_chunks=False) is not None:
             stem, dot, ext = name.rpartition(".")
             suffix = f"_{i}" if dot else f"_{i}"
             dest = f"{base}/{stem}{suffix}{dot}{ext}" if dot else f"{base}/{name}{suffix}"
@@ -2122,8 +2131,32 @@ class App:
         )
 
 
+def _start_db_maintenance(app):
+    """启动 DB 周期维护线程：清过期锁/去重记录 + PRAGMA optimize + WAL checkpoint。
+
+    长期运行库不维护的代价：查询计划统计过期（planner 选错索引）、WAL 只增不减、
+    chunk_dedup 表无限膨胀。首次维护在启动后 _DB_MAINT_FIRST_DELAY 秒，之后每
+    _DB_MAINT_INTERVAL 秒一次；daemon 线程，不阻塞退出。
+    """
+    first = float(os.environ.get("DB_MAINT_FIRST_DELAY", "600") or 600)
+    interval = float(os.environ.get("DB_MAINTENANCE_INTERVAL", "21600") or 21600)
+
+    def _loop():
+        time.sleep(first)
+        while True:
+            try:
+                st = app.db.maintenance(_CHUNK_DEDUP_TTL)
+                _log(f"DB 周期维护完成: {st}")
+            except Exception as e:
+                _log(f"DB 周期维护失败(忽略): {type(e).__name__}: {e}")
+            time.sleep(interval)
+
+    threading.Thread(target=_loop, name="db-maintenance", daemon=True).start()
+
+
 def make_server():
     app = App()
+    _start_db_maintenance(app)
     server = ThreadingHTTPServer((app.config.host, app.config.port), WebDAVHandler)
     server.app = app
     return server
