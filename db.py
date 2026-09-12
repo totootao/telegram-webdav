@@ -445,10 +445,12 @@ class MetaStore:
         全程单次持锁：查询后代、删 dst、批量写新路径、删 src 在同一事务内完成——
         既消灭了「先查后写」之间树结构被并发修改的 TOCTOU 窗口，也把万级子树的
         逐行 INSERT 合并为一次 executemany（行数越大收益越明显）。
+
+        移动保留被移动节点原有的 mtime / ctime：文件内容未变，修改时间（getlastmodified）
+        与创建时间（creationdate）不应因移动而改变（此前误把 mtime 重置为入库时间）。
         """
         if dst == src or dst.startswith(src + "/"):
             return False
-        now = int(time.time())
         with self._lock:
             nodes = self._fetch_subtree_locked(src, with_chunks=True)
             if not nodes:
@@ -469,11 +471,11 @@ class MetaStore:
                 [
                     (dst if n["path"] == src else dst + n["path"][len(src):],
                      n["name"], n["is_dir"], n["size"], n["content_type"], n["etag"],
-                     now, n["ctime"], n["chunk_size"], n["chunks"],
+                     n["mtime"], n["ctime"], n["chunk_size"], n["chunks"],
                      n.get("file_hash"), n.get("duration"),
                      _parent_of(dst if n["path"] == src else dst + n["path"][len(src):]),
                      n.get("first_file_id"), n.get("first_slot"),
-                     now)
+                     n["mtime"])
                     for n in nodes
                 ],
             )

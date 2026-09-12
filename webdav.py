@@ -64,6 +64,22 @@ def _now_iso(ts):
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def _parse_oc_mtime(headers):
+    """从请求头解析客户端传来的原始修改时间（Unix 秒）。
+
+    rclone / AList / Nextcloud 上传时通过 ``X-OC-Mtime`` 头带上源文件真实修改时间
+    （秒级时间戳，可能带小数）。返回 int 秒，解析不到或非法返回 None（调用方回退
+    入库时间）。头名大小写不敏感。
+    """
+    for k, v in (headers.items() if hasattr(headers, "items") else headers):
+        if k.lower() == "x-oc-mtime":
+            try:
+                return int(float(v))
+            except (ValueError, TypeError):
+                return None
+    return None
+
+
 def _fmt_dur(sec):
     """秒(float) -> 人类可读时长 ``H:MM:SS.mmm``；无法表示返回 ``-``。
 
@@ -1792,6 +1808,12 @@ class WebDAVHandler(BaseHTTPRequestHandler):
         if not ct:
             ct = _guess_ct(path.rsplit("/", 1)[-1])
 
+        # 原始修改时间：rclone / AList / Nextcloud 上传时通过 X-OC-Mtime 头带上
+        # 源文件的真实修改时间（秒级 Unix 时间戳，可能带小数）。收到则写入 mtime，
+        # 使 PROPFIND 的 getlastmodified 反映原始时间而非「入库时间」，这对 rclone
+        # 增量同步、去重、挂载后文件时间显示都很关键。缺省/非法则回退入库时间。
+        mtime = _parse_oc_mtime(self.headers)
+
         chunk_size = self.app.config.chunk_size
         # 原始文件名：写进 Telegram 频道消息，让人浏览频道时看到的就是原文件名
         # （参考 otterhub-server 的做法）。单分片直接用原名；多分片加 .partNN 后缀，
@@ -1864,6 +1886,7 @@ class WebDAVHandler(BaseHTTPRequestHandler):
             self.app.db.create_file(
                 path, ct, chunks_meta if total > 0 else [], total,
                 chunk_size=chunk_size if total > 0 else None,
+                mtime=mtime,
                 file_hash=file_hash.hexdigest() if total > 0 else None,
                 duration=duration,
             )
